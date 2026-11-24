@@ -69,9 +69,9 @@ def pwcheck(p):
 class User(Base):
  __tablename__='users';id=Column(String,primary_key=True,default=uid);username=Column(String,unique=True);name=Column(String);password_hash=Column(String);role=Column(String);active=Column(Boolean,default=True);student_id=Column(String)
 class Student(Base):
- __tablename__='students';id=Column(String,primary_key=True,default=uid);name=Column(String);number=Column(String);campus=Column(String);parentName=Column(String);parentPhone=Column(String);studentType=Column(String);planType=Column(String);purchaseDate=Column(String);expiryDate=Column(String);totalClasses=Column(Integer);remainingClasses=Column(Integer);legacyClasses=Column(Integer,default=0);totalLeaves=Column(Integer);remainingLeaves=Column(Integer);equipment=Column(JSON)
+ __tablename__='students';id=Column(String,primary_key=True,default=uid);name=Column(String);number=Column(String);campus=Column(String);parentName=Column(String);parentPhone=Column(String);studentType=Column(String);planType=Column(String);purchaseDate=Column(String);expiryDate=Column(String);totalClasses=Column(Integer);remainingClasses=Column(Integer);legacyClasses=Column('legacy_classes',Integer,default=0);totalLeaves=Column(Integer);remainingLeaves=Column(Integer);equipment=Column(JSON)
 class Attendance(Base):
- __tablename__='attendance';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));date=Column(String);campus=Column(String);status=Column(String);note=Column(String);deductedFrom=Column(String,default='plan');__table_args__=(UniqueConstraint('student_id','date'),)
+ __tablename__='attendance';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));date=Column(String);campus=Column(String);status=Column(String);note=Column(String);deductedFrom=Column('deducted_from',String,default='plan');__table_args__=(UniqueConstraint('student_id','date'),)
 class Renewal(Base):
  __tablename__='renewals';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));planType=Column(String);bankLast5=Column(String);requestTime=Column(String);status=Column(String);confirmTime=Column(String);prevExpiryDate=Column(String);newExpiryDate=Column(String)
 class Audit(Base):
@@ -284,7 +284,6 @@ def attendance(sid:str,p:AttendanceIn,db=Depends(dbdep),u=Depends(auth)):
   s.remainingLeaves=int(s.remainingLeaves)-1
   deducted_from='leave'
  else:
-  # 優先扣除舊生導入時的原本剩餘堂數，扣完後才扣除新購方案堂數
   if int(s.remainingClasses or 0)<1:raise HTTPException(409,'剩餘堂數不足')
   leg=int(s.legacyClasses or 0)
   if leg>0:
@@ -343,7 +342,6 @@ def renewal(sid:str,p:RenewalIn,db=Depends(dbdep),u=Depends(auth)):
  s=student(db,sid,True)
  if db.scalar(select(Renewal).where(Renewal.student_id==sid,Renewal.status=='pending')):raise HTTPException(409,'已有待審核續約')
  months=4 if p.planType=='A' else 6
- # 舊生原本堂數沒有到期日，首次新購方案時預估從申請日起算到期日（實際確認入帳時會重新依入帳日計算）
  base_dt=s.expiryDate if is_valid_iso_date(s.expiryDate) else tw_today()
  db.add(Renewal(student_id=sid,planType=p.planType,bankLast5=p.bankLast5,requestTime=now().isoformat(),status='pending',confirmTime='',prevExpiryDate=s.expiryDate,newExpiryDate=month(base_dt,months)))
  log(db,u,'renewal_request',sid);db.commit();return {'ok':True}
@@ -354,7 +352,6 @@ def approve(rid:str,db=Depends(dbdep),u=Depends(auth)):
  if not r or r.status!='pending':raise HTTPException(409,'無待審核資料')
  s=student(db,r.student_id,True);c,l,m=(11,4,4) if r.planType=='A' else (12,8,6)
  r.prevExpiryDate=s.expiryDate
- # 若原本為舊生無到期日狀態，新購方案確認入帳當日開始計算到期日；若已有方案到期日則往後展延
  base_dt=s.expiryDate if is_valid_iso_date(s.expiryDate) else tw_today()
  r.newExpiryDate=month(base_dt,m)
  s.expiryDate=r.newExpiryDate
@@ -437,7 +434,6 @@ def import_template(u=Depends(auth)):
  w=Workbook();sh=w.active;sh.title='學員匯入';sh.append(TEMPLATE_IMPORT_HEADERS)
  sh.append(['測試新生',15,'仁德學院','測試家長A','0900000001','新生','A','2026-11-02','',140,140,'M'])
  sh.append(['測試舊生',28,'南英學院','測試家長B','0900000002','舊生','B','2026-11-02',7,150,150,'L'])
- # 家長電話整欄設為純文字格式 (@)，避免 Excel 吃掉 0 開頭行動電話號碼
  sh.column_dimensions['E'].number_format='@'
  for r in range(1,1001):
   cell=sh.cell(row=r,column=5)
