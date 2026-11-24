@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi.responses import FileResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import create_engine,Column,String,Integer,Boolean,DateTime,ForeignKey,UniqueConstraint,select
+from sqlalchemy import create_engine,Column,String,Integer,Boolean,DateTime,ForeignKey,UniqueConstraint,select,text
 from sqlalchemy.orm import declarative_base,sessionmaker
 from sqlalchemy.types import JSON
 from argon2 import PasswordHasher
@@ -15,6 +15,8 @@ from argon2.exceptions import VerificationError
 P=Path(__file__).parent
 if not os.getenv('DATABASE_URL'):raise RuntimeError('DATABASE_URL PostgreSQL 未設定')
 engine=create_engine(os.environ['DATABASE_URL'].replace('postgres://','postgresql://',1),pool_pre_ping=True);Session=sessionmaker(engine);Base=declarative_base();ph=PasswordHasher()
+
+NO_EXPIRY_LABEL='不限期（未購新方案）'
 
 def clean_text(raw)->str:
  if raw is None:return ''
@@ -32,6 +34,29 @@ def normalize_phone(raw)->str:
  elif len(digits)==9 and digits.startswith('9'):digits='0'+digits
  return digits
 
+def parse_iso_date(raw)->str:
+ if isinstance(raw,(date,datetime)):
+  return raw.date().isoformat() if isinstance(raw,datetime) else raw.isoformat()
+ if isinstance(raw,(int,float)):
+  return (date(1899,12,30)+timedelta(days=int(raw))).isoformat()
+ s=clean_text(raw).replace('/','-')
+ parts=s.split('-')
+ if len(parts)==3:
+  s=f'{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+ date.fromisoformat(s)
+ return s
+
+def is_valid_iso_date(s:str)->bool:
+ if not s:return False
+ try:
+  date.fromisoformat(s)
+  return True
+ except ValueError:
+  return False
+
+def tw_today()->str:
+ return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+
 def now():return datetime.now(timezone.utc)
 def uid():return secrets.token_hex(12)
 def digest(t):return hashlib.sha256(t.encode()).hexdigest()
@@ -44,15 +69,23 @@ def pwcheck(p):
 class User(Base):
  __tablename__='users';id=Column(String,primary_key=True,default=uid);username=Column(String,unique=True);name=Column(String);password_hash=Column(String);role=Column(String);active=Column(Boolean,default=True);student_id=Column(String)
 class Student(Base):
- __tablename__='students';id=Column(String,primary_key=True,default=uid);name=Column(String);number=Column(String);campus=Column(String);parentName=Column(String);parentPhone=Column(String);studentType=Column(String);planType=Column(String);purchaseDate=Column(String);expiryDate=Column(String);totalClasses=Column(Integer);remainingClasses=Column(Integer);totalLeaves=Column(Integer);remainingLeaves=Column(Integer);equipment=Column(JSON)
+ __tablename__='students';id=Column(String,primary_key=True,default=uid);name=Column(String);number=Column(String);campus=Column(String);parentName=Column(String);parentPhone=Column(String);studentType=Column(String);planType=Column(String);purchaseDate=Column(String);expiryDate=Column(String);totalClasses=Column(Integer);remainingClasses=Column(Integer);legacyClasses=Column(Integer,default=0);totalLeaves=Column(Integer);remainingLeaves=Column(Integer);equipment=Column(JSON)
 class Attendance(Base):
- __tablename__='attendance';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));date=Column(String);campus=Column(String);status=Column(String);note=Column(String);__table_args__=(UniqueConstraint('student_id','date'),)
+ __tablename__='attendance';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));date=Column(String);campus=Column(String);status=Column(String);note=Column(String);deductedFrom=Column(String,default='plan');__table_args__=(UniqueConstraint('student_id','date'),)
 class Renewal(Base):
  __tablename__='renewals';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));planType=Column(String);bankLast5=Column(String);requestTime=Column(String);status=Column(String);confirmTime=Column(String);prevExpiryDate=Column(String);newExpiryDate=Column(String)
 class Audit(Base):
  __tablename__='audit';id=Column(String,primary_key=True,default=uid);actor=Column(String);action=Column(String);student_id=Column(String);detail=Column(String);time=Column(DateTime(timezone=True),default=now)
 class SessionToken(Base):
  __tablename__='sessions';token_hash=Column(String,primary_key=True);user_id=Column(String,ForeignKey('users.id'));expires=Column(DateTime(timezone=True))
+
+def ensure_schema():
+ Base.metadata.create_all(engine)
+ with engine.begin() as conn:
+  conn.execute(text("ALTER TABLE students ADD COLUMN IF NOT EXISTS legacy_classes INTEGER DEFAULT 0"))
+  conn.execute(text("UPDATE students SET legacy_classes = 0 WHERE legacy_classes IS NULL"))
+  conn.execute(text("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS deducted_from VARCHAR DEFAULT 'plan'"))
+  conn.execute(text("UPDATE attendance SET deducted_from = 'plan' WHERE deducted_from IS NULL"))
 
 def dbdep():
  with Session() as db:yield db
@@ -81,17 +114,30 @@ def student(db,sid,lock=False):
 def public(db,s):
  eq={**eqdefault(),**(s.equipment or {})};n=sum(bool(eq[k].get('issued')) for k in eqdefault());eq['status']='已領取' if n==6 else '部分領取' if n else '未領取'
  a=db.scalars(select(Attendance).where(Attendance.student_id==s.id).order_by(Attendance.date.desc())).all();r=db.scalars(select(Renewal).where(Renewal.student_id==s.id).order_by(Renewal.requestTime.desc())).all()
- return {**{k:getattr(s,k) for k in ['id','name','number','campus','parentName','parentPhone','studentType','planType','purchaseDate','expiryDate','totalClasses','remainingClasses','totalLeaves','remainingLeaves']},'equipment':eq,'attendanceHistory':[{k:getattr(x,k) for k in ['id','date','campus','status','note']} for x in a],'renewalRequests':[{k:getattr(x,k) for k in ['id','planType','bankLast5','requestTime','status','confirmTime','prevExpiryDate','newExpiryDate']} for x in r]}
+ leg=int(s.legacyClasses or 0)
+ rem=int(s.remainingClasses or 0)
+ plan_rem=max(0,rem-leg)
+ data={k:getattr(s,k) for k in ['id','name','number','campus','parentName','parentPhone','studentType','planType','purchaseDate','expiryDate','totalClasses','remainingClasses','totalLeaves','remainingLeaves']}
+ data['legacyClasses']=leg
+ data['planRemainingClasses']=plan_rem
+ return {**data,'equipment':eq,'attendanceHistory':[{k:getattr(x,k) for k in ['id','date','campus','status','note','deductedFrom']} for x in a],'renewalRequests':[{k:getattr(x,k) for k in ['id','planType','bankLast5','requestTime','status','confirmTime','prevExpiryDate','newExpiryDate']} for x in r]}
 
 @asynccontextmanager
 async def lifespan(app):
- Base.metadata.create_all(engine)
+ ensure_schema()
  initial=os.getenv('BOOTSTRAP_ADMIN_PASSWORD','')
  if initial:
   if not strong(initial):raise RuntimeError('BOOTSTRAP_ADMIN_PASSWORD 密碼強度不足')
   with Session() as db:
-   if not db.scalar(select(User).where(User.role=='superadmin')):
+   u=db.scalar(select(User).where(User.role=='superadmin'))
+   if not u:
     db.add(User(username=os.getenv('BOOTSTRAP_ADMIN_USERNAME','superadmin'),name='超級管理員',password_hash=ph.hash(initial),role='superadmin',active=True));db.commit()
+   elif os.getenv('FORCE_RESET_SUPERADMIN')=='1':
+    u.password_hash=ph.hash(initial)
+    u.active=True
+    for sess in db.scalars(select(SessionToken).where(SessionToken.user_id==u.id)).all():db.delete(sess)
+    db.add(Audit(actor='system',action='force_reset_superadmin',student_id='',detail=u.username))
+    db.commit()
  yield
 
 app=FastAPI(docs_url=None,redoc_url=None,lifespan=lifespan)
@@ -146,7 +192,20 @@ def students(db=Depends(dbdep),u=Depends(auth)):
  if u.role=='parent':q=q.where(Student.id==u.student_id)
  return [public(db,s) for s in db.scalars(q)]
 
-class StudentIn(BaseModel):name:str;number:str='';campus:str='仁德學院';parentName:str='';parentPhone:str;password:str;studentType:str='新生';planType:str='A';purchaseDate:str;equipment:dict|None=None
+class StudentIn(BaseModel):
+ name:str
+ number:str=''
+ campus:str='仁德學院'
+ parentName:str=''
+ parentPhone:str
+ password:str
+ studentType:str='新生'
+ planType:str='A'
+ purchaseDate:str
+ legacyClasses:int|None=None
+ remainingLeaves:int|None=None
+ equipment:dict|None=None
+
 @app.post('/api/students')
 def addstudent(p:StudentIn,db=Depends(dbdep),u=Depends(auth)):
  roles(u,'admin','superadmin');pwcheck(p.password)
@@ -154,7 +213,30 @@ def addstudent(p:StudentIn,db=Depends(dbdep),u=Depends(auth)):
  if not clean_text(p.name) or not re.fullmatch(r'09\d{8}',phone):raise HTTPException(400,'請填寫學員姓名與正確家長手機（09 開頭 10 碼）')
  if p.planType not in ('A','B'):raise HTTPException(400,'方案錯誤')
  if db.scalar(select(User).where(User.username==phone)):raise HTTPException(409,'家長帳號已存在，暫不支援共用手機多位學員')
- c,l,m=(11,4,4) if p.planType=='A' else (12,8,6);s=Student(name=clean_text(p.name),number=clean_text(p.number),campus=p.campus,parentName=clean_text(p.parentName),parentPhone=phone,studentType=p.studentType,planType=p.planType,purchaseDate=p.purchaseDate,expiryDate=month(p.purchaseDate,m),totalClasses=c,remainingClasses=c,totalLeaves=l,remainingLeaves=l,equipment={k:{'size':clean_text((p.equipment or {}).get(k,{}).get('size',''))[:30],'issued':False,'date':''} for k in eqdefault()});db.add(s);db.flush();db.add(User(username=phone,name=clean_text(p.parentName) or clean_text(p.name),role='parent',password_hash=ph.hash(p.password),student_id=s.id));log(db,u,'add_student',s.id);db.commit();return {'id':s.id}
+ try:
+  purchase_dt=parse_iso_date(p.purchaseDate)
+ except (ValueError,TypeError):
+  raise HTTPException(400,'日期格式錯誤，請使用 YYYY-MM-DD')
+ c,l,m=(11,4,4) if p.planType=='A' else (12,8,6)
+ if p.studentType=='舊生':
+  if p.legacyClasses is None or p.legacyClasses<0:
+   raise HTTPException(400,'舊生請填寫原本剩餘堂數（0 以上的整數）')
+  leg=int(p.legacyClasses)
+  tot_c=leg
+  rem_c=leg
+  exp_dt=NO_EXPIRY_LABEL
+  rem_l=l if p.remainingLeaves is None else int(p.remainingLeaves)
+  if rem_l<0:raise HTTPException(400,'剩餘請假不可為負數')
+  tot_l=max(l,rem_l)
+ else:
+  leg=0
+  tot_c=c
+  rem_c=c
+  exp_dt=month(purchase_dt,m)
+  tot_l=l
+  rem_l=l
+ s=Student(name=clean_text(p.name),number=clean_text(p.number),campus=p.campus,parentName=clean_text(p.parentName),parentPhone=phone,studentType=p.studentType,planType=p.planType,purchaseDate=purchase_dt,expiryDate=exp_dt,totalClasses=tot_c,remainingClasses=rem_c,legacyClasses=leg,totalLeaves=tot_l,remainingLeaves=rem_l,equipment={k:{'size':clean_text((p.equipment or {}).get(k,{}).get('size',''))[:30],'issued':False,'date':''} for k in eqdefault()})
+ db.add(s);db.flush();db.add(User(username=phone,name=clean_text(p.parentName) or clean_text(p.name),role='parent',password_hash=ph.hash(p.password),student_id=s.id));log(db,u,'add_student',s.id);db.commit();return {'id':s.id}
 
 # Account names are viewable by staff; password hashes and plaintext passwords are never returned.
 @app.get('/api/students/{sid}/account')
@@ -180,7 +262,6 @@ def reset_student_password(sid:str,p:ResetStudentPassword,db=Depends(dbdep),u=De
 def delete_student(sid:str,db=Depends(dbdep),u=Depends(auth)):
  roles(u,'superadmin')
  st=student(db,sid,True)
- # Remove dependents explicitly so the operation works without a schema migration.
  accounts=db.scalars(select(User).where(User.student_id==sid)).all()
  for account in accounts:
   for sess in db.scalars(select(SessionToken).where(SessionToken.user_id==account.id)).all():db.delete(sess)
@@ -197,15 +278,36 @@ def attendance(sid:str,p:AttendanceIn,db=Depends(dbdep),u=Depends(auth)):
  if p.status not in ('present','leave','absent'):raise HTTPException(400,'狀態錯誤')
  s=student(db,sid,True)
  if db.scalar(select(Attendance).where(Attendance.student_id==sid,Attendance.date==p.date)):raise HTTPException(409,'當日已點名')
- k='remainingLeaves' if p.status=='leave' else 'remainingClasses'
- if getattr(s,k)<1:raise HTTPException(409,'剩餘額度不足')
- setattr(s,k,getattr(s,k)-1);db.add(Attendance(student_id=sid,date=p.date,campus=s.campus,status=p.status,note=p.note));log(db,u,'attendance',sid,p.status);db.commit();return {'ok':True}
+ deducted_from='plan'
+ if p.status=='leave':
+  if int(s.remainingLeaves or 0)<1:raise HTTPException(409,'剩餘請假額度不足')
+  s.remainingLeaves=int(s.remainingLeaves)-1
+  deducted_from='leave'
+ else:
+  # 優先扣除舊生導入時的原本剩餘堂數，扣完後才扣除新購方案堂數
+  if int(s.remainingClasses or 0)<1:raise HTTPException(409,'剩餘堂數不足')
+  leg=int(s.legacyClasses or 0)
+  if leg>0:
+   s.legacyClasses=leg-1
+   deducted_from='legacy'
+  else:
+   deducted_from='plan'
+  s.remainingClasses=int(s.remainingClasses)-1
+ db.add(Attendance(student_id=sid,date=p.date,campus=s.campus,status=p.status,note=p.note,deductedFrom=deducted_from))
+ log(db,u,'attendance',sid,f'{p.status}:{deducted_from}')
+ db.commit();return {'ok':True}
 
 @app.delete('/api/students/{sid}/attendance/{day}')
 def cancel(sid:str,day:str,db=Depends(dbdep),u=Depends(auth)):
  roles(u,'admin','superadmin');s=student(db,sid,True);a=db.scalar(select(Attendance).where(Attendance.student_id==sid,Attendance.date==day))
  if not a:raise HTTPException(404,'找不到紀錄')
- k='remainingLeaves' if a.status=='leave' else 'remainingClasses';setattr(s,k,getattr(s,k)+1);db.delete(a);log(db,u,'cancel_attendance',sid,day);db.commit();return {'ok':True}
+ if a.status=='leave':
+  s.remainingLeaves=int(s.remainingLeaves or 0)+1
+ else:
+  s.remainingClasses=int(s.remainingClasses or 0)+1
+  if (a.deductedFrom or 'plan')=='legacy':
+   s.legacyClasses=int(s.legacyClasses or 0)+1
+ db.delete(a);log(db,u,'cancel_attendance',sid,day);db.commit();return {'ok':True}
 
 class NoteIn(BaseModel):note:str
 @app.patch('/api/students/{sid}/attendance/{day}')
@@ -219,12 +321,19 @@ class EquipmentIn(BaseModel):equipment:dict
 def equipment(sid:str,p:EquipmentIn,db=Depends(dbdep),u=Depends(auth)):
  roles(u,'admin','superadmin');s=student(db,sid,True);s.equipment={k:{'size':clean_text(p.equipment.get(k,{}).get('size','')),'issued':bool(p.equipment.get(k,{}).get('issued',False)),'date':clean_text(p.equipment.get(k,{}).get('date',''))} for k in eqdefault()};log(db,u,'equipment',sid);db.commit();return {'ok':True}
 
-class Balance(BaseModel):remainingClasses:int;remainingLeaves:int;reason:str=''
+class Balance(BaseModel):remainingClasses:int;legacyClasses:int|None=None;remainingLeaves:int;reason:str=''
 @app.patch('/api/students/{sid}/balance')
 def balance(sid:str,p:Balance,db=Depends(dbdep),u=Depends(auth)):
  roles(u,'superadmin')
  if min(p.remainingClasses,p.remainingLeaves)<0:raise HTTPException(400,'不可為負數')
- s=student(db,sid,True);s.remainingClasses=p.remainingClasses;s.remainingLeaves=p.remainingLeaves;log(db,u,'adjust_balance',sid,p.reason);db.commit();return {'ok':True}
+ s=student(db,sid,True)
+ leg=int(s.legacyClasses or 0) if p.legacyClasses is None else int(p.legacyClasses)
+ if leg<0:raise HTTPException(400,'原本剩餘堂數不可為負數')
+ if leg>p.remainingClasses:raise HTTPException(400,'原本剩餘堂數不可大於總剩餘堂數')
+ s.remainingClasses=p.remainingClasses
+ s.legacyClasses=leg
+ s.remainingLeaves=p.remainingLeaves
+ log(db,u,'adjust_balance',sid,p.reason);db.commit();return {'ok':True}
 
 class RenewalIn(BaseModel):planType:str;bankLast5:str
 @app.post('/api/students/{sid}/renewals')
@@ -233,13 +342,29 @@ def renewal(sid:str,p:RenewalIn,db=Depends(dbdep),u=Depends(auth)):
  if p.planType not in ('A','B') or not re.fullmatch('[0-9]{5}',p.bankLast5):raise HTTPException(400,'輸入不正確')
  s=student(db,sid,True)
  if db.scalar(select(Renewal).where(Renewal.student_id==sid,Renewal.status=='pending')):raise HTTPException(409,'已有待審核續約')
- db.add(Renewal(student_id=sid,planType=p.planType,bankLast5=p.bankLast5,requestTime=now().isoformat(),status='pending',confirmTime='',prevExpiryDate=s.expiryDate,newExpiryDate=month(s.expiryDate,4 if p.planType=='A' else 6)));log(db,u,'renewal_request',sid);db.commit();return {'ok':True}
+ months=4 if p.planType=='A' else 6
+ # 舊生原本堂數沒有到期日，首次新購方案時預估從申請日起算到期日（實際確認入帳時會重新依入帳日計算）
+ base_dt=s.expiryDate if is_valid_iso_date(s.expiryDate) else tw_today()
+ db.add(Renewal(student_id=sid,planType=p.planType,bankLast5=p.bankLast5,requestTime=now().isoformat(),status='pending',confirmTime='',prevExpiryDate=s.expiryDate,newExpiryDate=month(base_dt,months)))
+ log(db,u,'renewal_request',sid);db.commit();return {'ok':True}
 
 @app.post('/api/renewals/{rid}/approve')
 def approve(rid:str,db=Depends(dbdep),u=Depends(auth)):
  roles(u,'superadmin');r=db.scalar(select(Renewal).where(Renewal.id==rid).with_for_update())
  if not r or r.status!='pending':raise HTTPException(409,'無待審核資料')
- s=student(db,r.student_id,True);c,l,m=(11,4,4) if r.planType=='A' else (12,8,6);r.prevExpiryDate=s.expiryDate;r.newExpiryDate=month(s.expiryDate,m);s.expiryDate=r.newExpiryDate;s.planType=r.planType;s.totalClasses+=c;s.remainingClasses+=c;s.totalLeaves+=l;s.remainingLeaves+=l;r.status='approved';r.confirmTime=now().isoformat();log(db,u,'approve_renewal',s.id);db.commit();return {'ok':True}
+ s=student(db,r.student_id,True);c,l,m=(11,4,4) if r.planType=='A' else (12,8,6)
+ r.prevExpiryDate=s.expiryDate
+ # 若原本為舊生無到期日狀態，新購方案確認入帳當日開始計算到期日；若已有方案到期日則往後展延
+ base_dt=s.expiryDate if is_valid_iso_date(s.expiryDate) else tw_today()
+ r.newExpiryDate=month(base_dt,m)
+ s.expiryDate=r.newExpiryDate
+ s.planType=r.planType
+ s.totalClasses=int(s.totalClasses or 0)+c
+ s.remainingClasses=int(s.remainingClasses or 0)+c
+ s.totalLeaves=int(s.totalLeaves or 0)+l
+ s.remainingLeaves=int(s.remainingLeaves or 0)+l
+ r.status='approved';r.confirmTime=now().isoformat()
+ log(db,u,'approve_renewal',s.id);db.commit();return {'ok':True}
 
 class PasswordIn(BaseModel):oldPassword:str;newPassword:str
 @app.post('/api/password')
@@ -280,7 +405,7 @@ def export(db=Depends(dbdep),u=Depends(auth)):
  roles(u,'admin','superadmin')
  from openpyxl import Workbook
  w=Workbook();w.remove(w.active)
- for name,model,fields in [('學員名冊',Student,['id','name','number','campus','parentName','parentPhone','studentType','planType','purchaseDate','expiryDate','totalClasses','remainingClasses','totalLeaves','remainingLeaves']),('點名紀錄',Attendance,['student_id','date','campus','status','note']),('續約紀錄',Renewal,['student_id','planType','bankLast5','requestTime','status','confirmTime','prevExpiryDate','newExpiryDate'])]:
+ for name,model,fields in [('學員名冊',Student,['id','name','number','campus','parentName','parentPhone','studentType','planType','purchaseDate','expiryDate','totalClasses','remainingClasses','legacyClasses','totalLeaves','remainingLeaves']),('點名紀錄',Attendance,['student_id','date','campus','status','deductedFrom','note']),('續約紀錄',Renewal,['student_id','planType','bankLast5','requestTime','status','confirmTime','prevExpiryDate','newExpiryDate'])]:
   sh=w.create_sheet(name);sh.append(fields)
   if name=='學員名冊':
    sh.column_dimensions['F'].number_format='@'
@@ -302,13 +427,16 @@ def export(db=Depends(dbdep),u=Depends(auth)):
 
 
 # Bulk Excel import: single transaction; no plaintext passwords in spreadsheets.
-IMPORT_HEADERS = ['學員姓名','背號','場域','家長姓名','家長電話','新舊生','方案','購買生效日','制服尺寸','球褲尺寸','練習衣尺寸']
+REQUIRED_IMPORT_HEADERS = ['學員姓名','背號','場域','家長姓名','家長電話','新舊生','方案','購買生效日','制服尺寸','球褲尺寸','練習衣尺寸']
+TEMPLATE_IMPORT_HEADERS = ['學員姓名','背號','場域','家長姓名','家長電話','新舊生','方案','購買生效日','原本剩餘堂數','制服尺寸','球褲尺寸','練習衣尺寸']
+
 @app.get('/api/students/import-template.xlsx')
 def import_template(u=Depends(auth)):
  roles(u,'admin','superadmin')
  from openpyxl import Workbook
- w=Workbook();sh=w.active;sh.title='學員匯入';sh.append(IMPORT_HEADERS)
- sh.append(['測試學員',15,'仁德學院','測試家長','0900000000','新生','A','2026-11-02',140,140,'M'])
+ w=Workbook();sh=w.active;sh.title='學員匯入';sh.append(TEMPLATE_IMPORT_HEADERS)
+ sh.append(['測試新生',15,'仁德學院','測試家長A','0900000001','新生','A','2026-11-02','',140,140,'M'])
+ sh.append(['測試舊生',28,'南英學院','測試家長B','0900000002','舊生','B','2026-11-02',7,150,150,'L'])
  # 家長電話整欄設為純文字格式 (@)，避免 Excel 吃掉 0 開頭行動電話號碼
  sh.column_dimensions['E'].number_format='@'
  for r in range(1,1001):
@@ -318,8 +446,15 @@ def import_template(u=Depends(auth)):
    cell.value=str(cell.value)
  sh.freeze_panes='A2'
  for col in sh.columns:
-  sh.column_dimensions[col[0].column_letter].width=20
- sh2=w.create_sheet('使用說明');sh2.append(['僅上傳 .xlsx；第一列欄名請勿修改。範例第二列請刪除後再匯入。']);sh2.append(['家長電話：整欄已設定為純文字格式（@），直接輸入 0912345678 即可保留開頭的 0。']);sh2.append(['不含密碼：匯入的家長帳號預設停用，需由超級管理員重設密碼並啟用。']);sh2.append(['同一檔案內或資料庫中家長電話重複，整批拒絕，不會寫入部分資料。']);sh2.append(['方案 A：11 堂/4 個月/4 次請假；方案 B：12 堂/6 個月/8 次請假。'])
+  sh.column_dimensions[col[0].column_letter].width=18
+ sh2=w.create_sheet('使用說明')
+ sh2.append(['僅上傳 .xlsx；第一列欄名請勿修改。範例第 2、3 列請刪除後再匯入。'])
+ sh2.append(['新舊生為「新生」時：原本剩餘堂數請留空，系統自動依購買生效日與方案計算堂數與到期日。'])
+ sh2.append(['新舊生為「舊生」時：請填入「原本剩餘堂數」（數字），舊生原本堂數不計算到期日；後續新購方案時才開始計算到期日，且上課優先扣除原本剩餘堂數。'])
+ sh2.append(['家長電話：整欄已設定為純文字格式（@），直接輸入 0912345678 即可保留開頭的 0。'])
+ sh2.append(['不含密碼：匯入的家長帳號預設停用，需由超級管理員重設密碼並啟用。'])
+ sh2.append(['同一檔案內或資料庫中家長電話重複，整批拒絕，不會寫入部分資料。'])
+ sh2.append(['方案 A：11 堂/4 個月/4 次請假；方案 B：12 堂/6 個月/8 次請假。'])
  b=io.BytesIO();w.save(b);b.seek(0)
  return StreamingResponse(b,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="magic_students_import_template.xlsx"'})
 
@@ -335,37 +470,53 @@ async def import_students_excel(request:Request,db=Depends(dbdep),u=Depends(auth
   sh=w['學員匯入'] if '學員匯入' in w.sheetnames else w.active
   rows=sh.iter_rows(values_only=True)
   header=[clean_text(v) for v in next(rows)]
-  missing=[h for h in IMPORT_HEADERS if h not in header]
+  missing=[h for h in REQUIRED_IMPORT_HEADERS if h not in header]
   if missing:raise HTTPException(400,'缺少欄位：'+', '.join(missing))
-  idx={h:header.index(h) for h in IMPORT_HEADERS}
+  idx={h:header.index(h) for h in header if h}
   prepared=[];errors=[];seen=set()
   for excel_row,values in enumerate(rows,2):
    if excel_row>502:raise HTTPException(400,'單次最多匯入 500 位學員')
    if not any(v is not None and clean_text(v) for v in values):continue
    def val(k):
+    if k not in idx:return ''
     i=idx[k];v=values[i] if i<len(values) else None
     return clean_text(v)
    name=val('學員姓名')
    phone=normalize_phone(values[idx['家長電話']] if idx['家長電話']<len(values) else None)
    campus=val('場域')
+   stype=val('新舊生') or '新生'
    plan=val('方案').upper().replace('方案','').strip()
-   start=values[idx['購買生效日']] if idx['購買生效日']<len(values) else None
+   start_raw=values[idx['購買生效日']] if idx['購買生效日']<len(values) else None
    try:
-    if isinstance(start,(date,datetime)):start=start.date().isoformat() if isinstance(start,datetime) else start.isoformat()
-    elif isinstance(start,(int,float)):
-     base_dt=date(1899,12,30)+timedelta(days=int(start))
-     start=base_dt.isoformat()
-    else:
-     start=clean_text(start).replace('/','-')
-     parts=start.split('-')
-     if len(parts)==3:start=f'{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}'
-     date.fromisoformat(start)
-   except (ValueError,TypeError):errors.append(f'第 {excel_row} 列：購買生效日格式應為 YYYY-MM-DD');continue
+    start=parse_iso_date(start_raw)
+   except (ValueError,TypeError):
+    errors.append(f'第 {excel_row} 列：購買生效日格式應為 YYYY-MM-DD');continue
    if not name or not re.fullmatch(r'09\d{8}',phone):errors.append(f'第 {excel_row} 列：姓名或家長手機格式錯誤（須為 09 開頭 10 碼）');continue
    if campus not in ('仁德學院','南英學院') or plan not in ('A','B'):errors.append(f'第 {excel_row} 列：場域或方案錯誤');continue
+   if stype not in ('新生','舊生'):errors.append(f'第 {excel_row} 列：新舊生請填「新生」或「舊生」');continue
    if phone in seen:errors.append(f'第 {excel_row} 列：檔案內家長手機重複');continue
+
+   c,l,m=(11,4,4) if plan=='A' else (12,8,6)
+   raw_leg=val('原本剩餘堂數') or val('原本堂數')
+   if stype=='舊生':
+    if not raw_leg:
+     errors.append(f'第 {excel_row} 列：舊生請填寫「原本剩餘堂數」');continue
+    try:
+     leg=int(float(raw_leg))
+     if leg<0:raise ValueError()
+    except ValueError:
+     errors.append(f'第 {excel_row} 列：原本剩餘堂數須為 0 以上的整數');continue
+    tot_c=leg
+    rem_c=leg
+    exp_dt=NO_EXPIRY_LABEL
+   else:
+    leg=0
+    tot_c=c
+    rem_c=c
+    exp_dt=month(start,m)
+
    seen.add(phone)
-   prepared.append(dict(name=name,number=val('背號'),campus=campus,parentName=val('家長姓名'),parentPhone=phone,studentType=val('新舊生') or '新生',planType=plan,purchaseDate=start,jersey=val('制服尺寸'),pants=val('球褲尺寸'),practiceShirt=val('練習衣尺寸')))
+   prepared.append(dict(name=name,number=val('背號'),campus=campus,parentName=val('家長姓名'),parentPhone=phone,studentType=stype,planType=plan,purchaseDate=start,expiryDate=exp_dt,totalClasses=tot_c,remainingClasses=rem_c,legacyClasses=leg,totalLeaves=l,remainingLeaves=l,jersey=val('制服尺寸'),pants=val('球褲尺寸'),practiceShirt=val('練習衣尺寸')))
   w.close()
  except HTTPException:raise
  except Exception:raise HTTPException(400,'無法讀取 Excel，請使用下載的範本並另存為 .xlsx')
@@ -376,10 +527,9 @@ async def import_students_excel(request:Request,db=Depends(dbdep),u=Depends(auth
    errors.append(item['name']+'：家長手機已存在 '+item['parentPhone'][-4:])
  if errors:raise HTTPException(409,'；'.join(errors[:12])+'。本次未匯入任何資料')
  for item in prepared:
-  c,l,m=(11,4,4) if item['planType']=='A' else (12,8,6)
   eq=eqdefault()
   for k in ('jersey','pants','practiceShirt'):eq[k]['size']=item[k]
-  st=Student(name=item['name'],number=item['number'],campus=item['campus'],parentName=item['parentName'],parentPhone=item['parentPhone'],studentType=item['studentType'],planType=item['planType'],purchaseDate=item['purchaseDate'],expiryDate=month(item['purchaseDate'],m),totalClasses=c,remainingClasses=c,totalLeaves=l,remainingLeaves=l,equipment=eq)
+  st=Student(name=item['name'],number=item['number'],campus=item['campus'],parentName=item['parentName'],parentPhone=item['parentPhone'],studentType=item['studentType'],planType=item['planType'],purchaseDate=item['purchaseDate'],expiryDate=item['expiryDate'],totalClasses=item['totalClasses'],remainingClasses=item['remainingClasses'],legacyClasses=item['legacyClasses'],totalLeaves=item['totalLeaves'],remainingLeaves=item['remainingLeaves'],equipment=eq)
   db.add(st);db.flush()
   db.add(User(username=item['parentPhone'],name=item['parentName'] or item['name'],password_hash=ph.hash(secrets.token_urlsafe(32)),role='parent',active=False,student_id=st.id))
   log(db,u,'excel_import_student',st.id)
