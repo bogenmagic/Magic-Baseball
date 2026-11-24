@@ -89,6 +89,8 @@ class Attendance(Base):
  __tablename__='attendance';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));date=Column(String);campus=Column(String);status=Column(String);note=Column(String);deductedFrom=Column('deducted_from',String,default='plan');__table_args__=(UniqueConstraint('student_id','date'),)
 class Renewal(Base):
  __tablename__='renewals';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));planType=Column(String);bankLast5=Column(String);requestTime=Column(String);status=Column(String);confirmTime=Column(String);prevExpiryDate=Column(String);newExpiryDate=Column(String)
+class Announcement(Base):
+ __tablename__='announcements';id=Column(String,primary_key=True,default=uid);title=Column(String);content=Column(String);campus=Column(String,default='ALL');pinned=Column(Boolean,default=False);author=Column(String);createdAt=Column('created_at',String)
 class Audit(Base):
  __tablename__='audit';id=Column(String,primary_key=True,default=uid);actor=Column(String);action=Column(String);student_id=Column(String);detail=Column(String);time=Column(DateTime(timezone=True),default=now)
 class SessionToken(Base):
@@ -205,6 +207,59 @@ def logout(request:Request,response:Response,db=Depends(dbdep)):
 
 @app.get('/api/me')
 def me(u=Depends(auth)):return {'role':u.role,'name':u.name,'username':u.username,'campuses':user_campuses(u)}
+
+@app.get('/api/announcements')
+def list_announcements(db=Depends(dbdep),u=Depends(auth)):
+ rows=db.scalars(select(Announcement).order_by(Announcement.pinned.desc(),Announcement.createdAt.desc())).all()
+ if u.role=='parent':
+  st=db.get(Student,u.student_id)
+  sc=st.campus if st else ''
+  rows=[r for r in rows if r.campus in ('ALL',sc)]
+ elif u.role=='admin':
+  ac=user_campuses(u)
+  rows=[r for r in rows if r.campus in ('ALL',*ac)]
+ return [{'id':r.id,'title':r.title,'content':r.content,'campus':r.campus,'pinned':bool(r.pinned),'author':r.author,'createdAt':r.createdAt} for r in rows]
+
+class AnnouncementIn(BaseModel):
+ title:str
+ content:str
+ campus:str='ALL'
+ pinned:bool=False
+
+@app.post('/api/announcements')
+def create_announcement(p:AnnouncementIn,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'admin','superadmin')
+ title=clean_text(p.title)
+ content=(p.content or '').strip()
+ if not title or not content:
+  raise HTTPException(400,'請填寫公告標題與內容')
+ ac=user_campuses(u)
+ target=p.campus or 'ALL'
+ if target=='ALL':
+  if u.role=='admin' and len(ac)<len(ALL_CAMPUSES):
+   target=ac[0]
+ elif target not in ALL_CAMPUSES:
+  raise HTTPException(400,'學院選擇錯誤')
+ elif u.role=='admin' and target not in ac:
+  raise HTTPException(403,f'您沒有「{target}」的公告發佈權限')
+ tw_now=datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+ ann=Announcement(title=title,content=content,campus=target,pinned=bool(p.pinned),author=u.name or u.username,createdAt=tw_now)
+ db.add(ann)
+ log(db,u,'add_announcement',detail=f'{target}: {title}')
+ db.commit()
+ return {'id':ann.id}
+
+@app.delete('/api/announcements/{aid}')
+def delete_announcement(aid:str,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'admin','superadmin')
+ ann=db.get(Announcement,aid)
+ if not ann:raise HTTPException(404,'公告不存在')
+ if u.role=='admin':
+  ac=user_campuses(u)
+  if ann.campus not in ac and ann.author not in (u.name,u.username):
+   raise HTTPException(403,'無權刪除此公告')
+ log(db,u,'delete_announcement',detail=ann.title)
+ db.delete(ann);db.commit();return {'ok':True}
 
 @app.get('/api/students')
 def students(db=Depends(dbdep),u=Depends(auth)):
