@@ -1,113 +1,238 @@
 <!doctype html><html lang="zh-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>魔法棒球學院｜課務管理</title><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/react@18/umd/react.production.min.js"></script><script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script><script src="https://unpkg.com/@babel/standalone/babel.min.js"></script></head><body class="bg-slate-100 text-slate-800"><div id="root"></div><script type="text/babel">
 const {useState,useEffect}=React;
-const ALL_CAMPUSES=['仁德學院','南英學院'];
 async function api(path,method='GET',body){let r=await fetch('/api'+path,{method,credentials:'same-origin',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});if(!r.ok){let e=await r.json().catch(()=>({}));throw Error(e.detail||'操作失敗')}return r.headers.get('content-type')?.includes('json')?r.json():r}
+function App(){
+  const [user,U]=useState(null),[students,S]=useState([]),[announcements,ANN]=useState([]),[tab,T]=useState('checkin'),[campus,C]=useState('ALL'),[annCampus,AC]=useState('ALL'),[annAudience,AA]=useState('ALL'),[day,D]=useState(new Date().toLocaleDateString('en-CA')),[login,L]=useState({username:'',password:''}),[form,F]=useState(null),[admins,A]=useState([]),[msg,M]=useState(''),[notes,N]=useState({}),[modalError,ME]=useState('');
+  const call=async(fn)=>{try{await fn();M('操作成功');await refresh()}catch(e){M('⚠ '+e.message);ME(e.message)}};
+  const refresh=async()=>{
+    const [stList,annList]=await Promise.all([api('/students'),api('/announcements')]);
+    S(stList);ANN(annList);
+    if(user?.role==='superadmin')A(await api('/admins'));
+  };
+  useEffect(()=>{api('/me').then(U).catch(()=>{})},[]);
+  useEffect(()=>{if(user)refresh().catch(e=>M(e.message))},[user]);
 
-function getParentAlerts(stList){
-  const alerts=[];
-  const today=new Date(new Date().toLocaleDateString('en-CA')+'T00:00:00');
-  for(const s of (stList||[])){
-    const hasPending=(s.renewalRequests||[]).some(r=>r.status==='pending');
-    const rem=Number(s.remainingClasses||0);
-    if(rem<=2){
-      alerts.push({
-        sid:s.id,
-        studentName:s.name,
-        type:'low_classes',
-        title:`【堂數不足提醒】${s.name} 目前僅剩 ${rem} 堂課`,
-        desc:rem===0?'您的上課堂數已全部使用完畢，為避免影響後續排課，請盡快辦理線上續約。':`您的剩餘堂數僅剩 ${rem} 堂，建議提前辦理線上續約，確保上課權益不中斷。`
-      });
-    }
-    if(/^\d{4}-\d{2}-\d{2}$/.test(s.expiryDate||'') && !hasPending){
-      const exp=new Date(s.expiryDate+'T00:00:00');
-      const diffDays=Math.ceil((exp-today)/86400000);
-      if(diffDays<=14){
-        alerts.push({
-          sid:s.id,
-          studentName:s.name,
-          type:'expiring',
-          title:diffDays<0?`【方案已到期提醒】${s.name} 方案已於 ${s.expiryDate} 到期`:diffDays===0?`【方案今日到期提醒】${s.name} 方案將於今日（${s.expiryDate}）到期`:`【方案即將到期提醒】${s.name} 方案將於 ${diffDays} 天後（${s.expiryDate}）到期`,
-          desc:'系統顯示您尚未提出續約申請，請點擊下方「立即線上續約」完成續約登記。'
-        });
-      }
-    }
-  }
-  return alerts;
-}
+  const superuser=user?.role==='superadmin';
+  const isStaff=user&&user.role!=='parent';
+  const userCampuses=superuser?['仁德學院','南英學院']:(user?.campuses||['仁德學院','南英學院']);
+  const canPostAllCampus=superuser||userCampuses.length>=2;
+  const filtered=students.filter(s=>campus==='ALL'||s.campus===campus);
+  const [onlyPresent,OP]=useState(false);
+  const presentCount=filtered.filter(s=>s.attendanceHistory?.some(a=>a.date===day&&a.status==='present')).length;
+  const checkinStudents=onlyPresent?filtered.filter(s=>s.attendanceHistory?.some(a=>a.date===day&&a.status==='present')):filtered;
+  const labels={jersey:'制服',pants:'球褲',practiceShirt:'練習衣',hat:'帽子',belt:'皮帶',towel:'毛巾'};
 
-function App(){const [user,U]=useState(null),[students,S]=useState([]),[tab,T]=useState('checkin'),[campus,C]=useState('ALL'),[day,D]=useState(new Date().toLocaleDateString('en-CA')),[login,L]=useState({username:'',password:''}),[form,F]=useState(null),[admins,A]=useState([]),[announcements,ANN]=useState([]),[parentAlerts,PA]=useState([]),[msg,M]=useState(''),[notes,N]=useState({}),[modalError,ME]=useState(''),[showPwd,SP]=useState({});const togglePwd=k=>SP(p=>({...p,[k]:!p[k]}));const eyeBtn=k=><button type="button" onClick={()=>togglePwd(k)} className="px-3 text-xs font-bold text-slate-600 hover:text-blue-950 whitespace-nowrap select-none">{showPwd[k]?'🙈 隱藏':'👁 顯示'}</button>;
-const allowedCampuses=user?.role==='superadmin'?ALL_CAMPUSES:(user?.campuses?.length?user.campuses:ALL_CAMPUSES);
-const refresh=async(uOverride,checkAlerts=false)=>{const curUser=uOverride||user;if(!curUser)return;const tasks=[api('/students').then(list=>{S(list);if(checkAlerts && curUser.role==='parent'){const al=getParentAlerts(list);if(al.length)PA(al)}}),api('/announcements').then(ANN)];if(curUser.role==='superadmin')tasks.push(api('/admins').then(A));const res=await Promise.allSettled(tasks);const rejected=res.find(r=>r.status==='rejected');if(rejected)throw rejected.reason};
-const call=async(fn)=>{try{await fn();M('操作成功');await refresh()}catch(e){M('⚠ '+e.message);ME(e.message)}};
-useEffect(()=>{api('/me').then(u=>{U(u);if(u?.role==='parent')refresh(u,true).catch(()=>{})}).catch(()=>{})},[]);
-useEffect(()=>{if(user){const ac=user.role==='superadmin'?ALL_CAMPUSES:(user.campuses?.length?user.campuses:ALL_CAMPUSES);setCampusSafe(ac);if(user.role!=='parent')refresh(user,false).catch(e=>M('⚠ '+e.message))}},[user]);
-const setCampusSafe=(ac)=>{if(ac.length===1)C(ac[0]);else C('ALL')};
-const filtered=students.filter(s=>campus==='ALL'||s.campus===campus);const [onlyPresent,OP]=useState(false);const presentCount=filtered.filter(s=>s.attendanceHistory?.some(a=>a.date===day&&a.status==='present')).length;const checkinStudents=onlyPresent?filtered.filter(s=>s.attendanceHistory?.some(a=>a.date===day&&a.status==='present')):filtered;const superuser=user?.role==='superadmin';const labels={jersey:'制服',pants:'球褲',practiceShirt:'練習衣',hat:'帽子',belt:'皮帶',towel:'毛巾'};
-const field=(key,label,type='text',choices)=> <label className="block text-sm mb-2"><span className="font-bold">{label}</span>{choices?<select className="block border rounded p-2 w-full" value={form[key]||''} onChange={e=>F({...form,[key]:e.target.value})}>{choices.map(x=><option key={x} value={x}>{x}</option>)}</select>:type==='password'?<div className="flex items-center border rounded bg-white focus-within:ring-1 focus-within:ring-blue-900"><input type={showPwd[key]?'text':'password'} className="p-2 w-full outline-none rounded-l" value={form[key]??''} onChange={e=>F({...form,[key]:e.target.value})}/>{eyeBtn(key)}</div>:type==='textarea'?<textarea rows={4} className="block border rounded p-2 w-full" value={form[key]??''} onChange={e=>F({...form,[key]:e.target.value})}/>:<input type={type} min={type==='number'?0:undefined} className="block border rounded p-2 w-full" value={form[key]??''} onChange={e=>F({...form,[key]:e.target.value})}/>}</label>;
-const toggleCampusChoice=(c)=>{const cur=form.campuses||[];const next=cur.includes(c)?cur.filter(x=>x!==c):[...cur,c];F({...form,campuses:next})};
-const campusCheckboxes=()=><div className="mb-3"><span className="block text-sm font-bold mb-1">可管理的學院（至少勾選一項）</span><div className="flex flex-wrap gap-3 bg-slate-50 border rounded p-3">{ALL_CAMPUSES.map(c=><label key={c} className="flex items-center gap-2 text-sm font-bold cursor-pointer"><input type="checkbox" checked={(form.campuses||[]).includes(c)} onChange={()=>toggleCampusChoice(c)}/>{c}</label>)}</div></div>;
-const openForm=(value)=>{ME('');SP({});F(value)};const btn=(label,fn,style='bg-slate-800 text-white')=><button type="button" className={'rounded px-3 py-2 text-sm font-bold m-1 '+style+' '+(/\btext-(?:white|blue-950)\b/.test(style)?'':'text-white')} onClick={fn}>{label}</button>;
-if(!user)return (
-  <div
-    className="min-h-screen w-full bg-cover bg-center bg-no-repeat flex items-center justify-center p-4"
-    style={{
-      backgroundImage:"radial-gradient(circle at center, rgba(6, 20, 38, 0.55) 0%, rgba(4, 13, 26, 0.85) 100%), url('/static/login-bg.jpg')",
-      backgroundPosition:'center center'
-    }}
-  >
-    <div className="w-full max-w-md bg-slate-950/80 backdrop-blur-md border border-cyan-400/35 p-8 rounded-2xl shadow-2xl text-white">
-      <img
-        src="/static/logo.jpg"
-        alt="魔法棒球學院 Logo"
-        className="w-28 h-28 mx-auto rounded-full object-cover border-2 border-cyan-400/70 shadow-lg shadow-cyan-500/20"
-      />
-      <div className="text-center mt-4 mb-6">
-        <h1 className="text-2xl font-black tracking-wide text-white drop-shadow">魔法棒球學院</h1>
-        <p className="text-xs text-cyan-300 mt-1 tracking-wider">課務點名與方案管理系統</p>
-      </div>
-      <form onSubmit={e=>{e.preventDefault();call(async()=>{const u=await api('/login','POST',login);U(u);SP({});await refresh(u,true)})}}>
-        <input
-          className="bg-slate-900/90 border border-cyan-500/40 text-white placeholder-slate-400 p-3 rounded-lg w-full mb-3 focus:outline-none focus:border-cyan-400"
-          placeholder="帳號／家長手機"
-          value={login.username}
-          onChange={e=>L({...login,username:e.target.value})}
-        />
-        <div className="flex items-center bg-slate-900/90 border border-cyan-500/40 rounded-lg w-full mb-4 focus-within:border-cyan-400">
-          <input
-            className="p-3 w-full bg-transparent text-white placeholder-slate-400 outline-none rounded-l-lg"
-            type={showPwd.login?'text':'password'}
-            placeholder="密碼"
-            value={login.password}
-            onChange={e=>L({...login,password:e.target.value})}
-          />
-          <button
-            type="button"
-            onClick={()=>togglePwd('login')}
-            className="px-3 text-xs font-bold text-cyan-300 hover:text-white whitespace-nowrap select-none"
-          >
-            {showPwd.login?'🙈 隱藏':'👁 顯示'}
-          </button>
+  const audienceMeta={
+    admin:{label:'管理群公告',badge:'bg-indigo-100 text-indigo-800 border-indigo-200'},
+    student:{label:'學員公告',badge:'bg-emerald-100 text-emerald-800 border-emerald-200'},
+    all:{label:'全體公告',badge:'bg-sky-100 text-sky-800 border-sky-200'}
+  };
+  const campusBadge=(c)=>c==='仁德學院'?'bg-teal-900 text-white':c==='南英學院'?'bg-rose-900 text-white':'bg-blue-950 text-white';
+  const sortAnns=(list)=>[...list].sort((a,b)=>(b.pinned?1:0)-(a.pinned?1:0)||String(b.createdAt).localeCompare(String(a.createdAt)));
+
+  const visibleAnns=sortAnns(announcements.filter(a=>{
+    if(annCampus!=='ALL'&&a.campus!=='ALL'&&a.campus!==annCampus)return false;
+    if(annAudience!=='ALL'&&(a.audience||'all')!==annAudience)return false;
+    return true;
+  }));
+
+  const field=(key,label,type='text',choices)=> <label className="block text-sm mb-2"><span className="font-bold">{label}</span>{choices?<select className="block border rounded p-2 w-full" value={form[key]||''} onChange={e=>F({...form,[key]:e.target.value})}>{choices.map(x=>typeof x==='object'?<option key={x.value} value={x.value}>{x.label}</option>:<option key={x} value={x}>{x}</option>)}</select>:<input type={type} className="block border rounded p-2 w-full" value={form[key]??''} onChange={e=>F({...form,[key]:e.target.value})}/>}</label>;
+  const openForm=(value)=>{ME('');F(value)};
+  const btn=(label,fn,style='bg-slate-800 text-white')=><button type="button" className={'rounded px-3 py-1.5 text-sm font-bold m-1 '+style+' '+(/\btext-(?:white|blue-950|amber-950)\b/.test(style)?'':'text-white')} onClick={fn}>{label}</button>;
+
+  if(!user)return <div className="max-w-md mx-auto mt-14 bg-white p-8 rounded-2xl shadow"><img src="/static/logo.jpg" className="w-28 h-28 mx-auto rounded-full"/><h1 className="text-center text-2xl font-black text-blue-950 my-4">魔法棒球學院</h1><form onSubmit={e=>{e.preventDefault();call(async()=>{U(await api('/login','POST',login))})}}><input className="border p-3 rounded w-full mb-3" placeholder="帳號／家長手機" value={login.username} onChange={e=>L({...login,username:e.target.value})}/><input className="border p-3 rounded w-full mb-3" type="password" placeholder="密碼" value={login.password} onChange={e=>L({...login,password:e.target.value})}/><button className="bg-blue-950 text-white p-3 rounded w-full font-bold">登入</button></form><p className="text-red-600 mt-3">{msg}</p></div>;
+
+  return <>
+  <header className="bg-[#0B2545] text-white p-4 flex flex-wrap gap-3 items-center justify-between">
+    <div className="flex items-center gap-3"><img src="/static/logo.jpg" className="w-12 h-12 rounded-full"/><div><h1 className="font-black text-xl">魔法棒球學院</h1><p className="text-xs">課務點名與方案管理系統</p></div></div>
+    <div>{user.name}（{user.role}）{btn('修改密碼',()=>openForm({kind:'password',oldPassword:'',newPassword:''}),'bg-blue-700')}{btn('登出',()=>call(async()=>{await api('/logout','POST');U(null);S([]);ANN([])}),'bg-red-600')}</div>
+  </header>
+
+  <main className="max-w-7xl mx-auto p-4">
+    {msg&&<p className="p-2.5 bg-amber-50 border border-amber-300 text-amber-950 mb-3 rounded cursor-pointer font-medium" onClick={()=>M('')}>{msg}（點此關閉）</p>}
+
+    {/* ==================== 登入後直接可見：學院公告系統 ==================== */}
+    <section className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b">
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="font-black text-lg text-[#0B2545] mr-1">📢 學院公告欄</h2>
+          {/* 學院分館篩選頁籤 */}
+          <div className="inline-flex rounded-lg bg-slate-100 p-1">
+            {[{v:'ALL',l:'全院'},...(isStaff?userCampuses:['仁德學院','南英學院']).map(c=>({v:c,l:c}))].map(x=>(
+              <button key={x.v} type="button" onClick={()=>AC(x.v)} className={'px-2.5 py-1 rounded-md text-xs font-bold transition '+(annCampus===x.v?'bg-[#0B2545] text-white shadow-xs':'text-slate-600 hover:text-slate-900')}>
+                {x.l}
+              </button>
+            ))}
+          </div>
+          {/* 群組分類篩選頁籤 */}
+          <div className="inline-flex rounded-lg bg-slate-100 p-1">
+            {[
+              {v:'ALL',l:'全部類別'},
+              ...(isStaff?[{v:'admin',l:'管理群公告'}]:[]),
+              {v:'student',l:'學員公告'},
+              {v:'all',l:'全體公告'}
+            ].map(x=>(
+              <button key={x.v} type="button" onClick={()=>AA(x.v)} className={'px-2.5 py-1 rounded-md text-xs font-bold transition '+(annAudience===x.v?'bg-emerald-700 text-white shadow-xs':'text-slate-600 hover:text-slate-900')}>
+                {x.l}
+              </button>
+            ))}
+          </div>
         </div>
-        <button className="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-black p-3 rounded-lg w-full shadow-lg transition">
-          登入
-        </button>
-      </form>
-      {msg&&<p className="text-red-300 bg-red-950/75 border border-red-500/40 rounded p-2 text-sm mt-3 text-center">{msg}</p>}
+
+        {isStaff && btn('＋發布公告',()=>openForm({
+          kind:'announcement',
+          id:null,
+          campus:canPostAllCampus?'ALL':userCampuses[0],
+          audience:'all',
+          title:'',
+          content:'',
+          pinned:false
+        }),'bg-orange-500 text-white')}
+      </div>
+
+      <div className="mt-3 space-y-2.5">
+        {visibleAnns.length===0
+          ? <p className="text-sm text-slate-400 py-4 text-center">目前篩選條件下尚無公告事項</p>
+          : visibleAnns.map(a=>{
+            const audInfo=audienceMeta[a.audience||'all']||audienceMeta.all;
+            return (
+              <div key={a.id} className={'p-3.5 rounded-lg border transition '+(a.pinned?'bg-amber-50/85 border-amber-300 shadow-xs':'bg-slate-50/70 border-slate-200')}>
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {a.pinned && <span className="bg-amber-500 text-white text-xs font-black px-2 py-0.5 rounded">📌 置頂</span>}
+                    <span className={'text-xs font-bold px-2 py-0.5 rounded '+campusBadge(a.campus)}>
+                      {a.campus==='ALL'?'全院共用':a.campus}
+                    </span>
+                    <span className={'text-xs font-bold px-2 py-0.5 rounded border '+audInfo.badge}>
+                      {audInfo.label}
+                    </span>
+                    <h3 className="font-black text-base text-slate-900 ml-1">{a.title}</h3>
+                  </div>
+
+                  {isStaff && <div className="flex items-center gap-1">
+                    <button type="button" onClick={()=>call(()=>api('/announcements/'+a.id+'/pin','PATCH'))} className={'px-2 py-1 rounded text-xs font-bold '+(a.pinned?'bg-amber-200 text-amber-950':'bg-slate-200 text-slate-700 hover:bg-slate-300')}>
+                      {a.pinned?'取消置頂':'📌 置頂'}
+                    </button>
+                    <button type="button" onClick={()=>openForm({kind:'announcement',id:a.id,campus:a.campus||'ALL',audience:a.audience||'all',title:a.title,content:a.content,pinned:a.pinned})} className="px-2 py-1 rounded text-xs font-bold bg-blue-100 text-blue-900 hover:bg-blue-200">
+                      編輯
+                    </button>
+                    <button type="button" onClick={async()=>{if(window.confirm('確定刪除此則公告「'+a.title+'」？'))await call(()=>api('/announcements/'+a.id,'DELETE'))}} className="px-2 py-1 rounded text-xs font-bold bg-red-100 text-red-800 hover:bg-red-200">
+                      刪除
+                    </button>
+                  </div>}
+                </div>
+                <p className="text-sm text-slate-700 whitespace-pre-line mt-2 leading-relaxed">{a.content}</p>
+                <p className="text-xs text-slate-400 mt-2">發布者：{a.author}｜時間：{a.createdAt}</p>
+              </div>
+            );
+          })
+        }
+      </div>
+    </section>
+
+    {/* ==================== 導覽列 ==================== */}
+    {isStaff&&<nav className="bg-[#0B2545] rounded-xl p-3 flex flex-wrap gap-2 mb-4 items-center">
+      {['checkin','students','stats','equipment',...(superuser?['renewals','admins']:[])].map((x,i)=>btn(['⚾ 點名','👥 學員','📊 統計','👕 裝備','💳 續約審核','⚙️ 管理員'][i],()=>T(x),tab===x?'bg-amber-400 text-blue-950':'bg-slate-700 text-white'))}
+      {btn('＋新增學員',()=>openForm({kind:'student',name:'',number:'',campus:userCampuses[0]||'仁德學院',parentName:'',parentPhone:'',password:'',studentType:'新生',planType:'A',purchaseDate:day,legacyClasses:'',remainingLeaves:'',equipment:Object.fromEntries(Object.keys(labels).map(k=>[k,{size:'',issued:false,date:''}]))}),'bg-orange-400 text-blue-950')}
+      {btn('Excel 匯出',()=>window.location.href='/api/export.xlsx','bg-green-700')}
+      {btn('下載匯入範本',()=>window.location.href='/api/students/import-template.xlsx','bg-sky-700')}
+      <label className="inline-block rounded px-3 py-1.5 text-sm font-bold m-1 bg-indigo-700 text-white cursor-pointer">📥 Excel 批次匯入<input type="file" accept=".xlsx" className="hidden" onChange={async e=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;if(!window.confirm('確定匯入 '+file.name+'？重複帳號或格式錯誤時整批不匯入。'))return;try{const res=await fetch('/api/students/import.xlsx',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},body:await file.arrayBuffer()});const data=await res.json().catch(()=>({}));if(!res.ok)throw Error(data.detail||'匯入失敗');M(data.message||'匯入完成');await refresh();T('students')}catch(err){M('⚠ Excel 匯入失敗：'+err.message)}}}/></label>
+      <select value={campus} onChange={e=>C(e.target.value)} className="p-2 rounded font-bold text-sm ml-auto">
+        {['ALL',...userCampuses].map(x=><option key={x} value={x}>{x==='ALL'?'全部學院':x}</option>)}
+      </select>
+    </nav>}
+
+    {/* ==================== 家長／學員專區 ==================== */}
+    {!isStaff?students.map(s=><section key={s.id} className="bg-white p-5 rounded-xl mb-4 shadow-sm"><h2 className="text-xl font-black">{s.name} #{s.number}</h2><p>{s.campus}｜方案 {s.planType}｜到期 {s.expiryDate}</p><p className="my-3">剩餘堂數：{s.remainingClasses}/{s.totalClasses}{s.legacyClasses>0&&`（含原本剩餘 ${s.legacyClasses} 堂）`}｜剩餘請假：{s.remainingLeaves}/{s.totalLeaves}</p>{btn('線上續約',()=>openForm({kind:'renewal',sid:s.id,planType:'A',bankLast5:''}),'bg-orange-500')}<h3 className="font-bold mt-4">出席紀錄與教練評語</h3>{s.attendanceHistory.map(a=><p key={a.id} className="border-b py-2">{a.date} {a.status} {a.note}</p>)}<h3 className="font-bold mt-4">裝備領用</h3>{Object.entries(labels).map(([k,v])=><p key={k}>{v}：{s.equipment[k]?.issued?'已領':'未領'} {s.equipment[k]?.size}</p>)}<h3 className="font-bold mt-4">續約紀錄</h3>{s.renewalRequests.map(r=><p key={r.id}>{r.requestTime} 方案{r.planType} {r.status}</p>)}</section>):null}
+
+    {/* ==================== 管理者功能分頁 ==================== */}
+    {tab==='checkin'&&isStaff&&<section className="bg-white p-4 rounded-xl overflow-x-auto"><h2 className="font-bold text-lg">⚾ 快捷點名與評語</h2><div className="flex flex-wrap items-center gap-3 my-3"><span className="bg-emerald-100 text-emerald-900 font-bold rounded-lg px-4 py-2">當日實際到課：{presentCount} 人</span><label className="flex items-center gap-2"><input type="checkbox" checked={onlyPresent} onChange={e=>OP(e.target.checked)}/>僅顯示到課學員</label><span className="text-sm text-slate-500">依日期及目前選擇分館統計（不含請假、缺席）</span></div><label>點名日期 <input type="date" className="border p-2 rounded" value={day} onChange={e=>D(e.target.value)}/></label><table className="w-full text-sm mt-4"><thead><tr className="bg-slate-100">{['學員','剩餘堂數','點名狀態','教練評語','調整'].map(x=><th key={x} className="p-2 text-left">{x}</th>)}</tr></thead><tbody>{checkinStudents.map(s=>{let a=s.attendanceHistory.find(x=>x.date===day);return <tr className="border-b" key={s.id}><td className="p-2 font-bold">{s.name} #{s.number}<p className="text-xs text-slate-500">{s.campus}</p></td><td>{s.remainingClasses}/{s.totalClasses}{s.legacyClasses>0&&<span className="text-xs text-amber-700 block">舊生剩餘 {s.legacyClasses}</span>}</td><td>{a?<>{a.status}{btn('取消點名',()=>call(()=>api('/students/'+s.id+'/attendance/'+day,'DELETE')),'bg-red-600')}</>:['present','leave','absent'].map((x,i)=>btn(['到課','請假','缺席'][i],()=>call(()=>api('/students/'+s.id+'/attendance','POST',{date:day,status:x,note:notes[s.id]||''})),['bg-green-600','bg-amber-500','bg-red-600'][i]+' text-white'))}</td><td><input className="border p-2 rounded" placeholder={a?.note||'教練評語'} value={notes[s.id]||''} onChange={e=>N({...notes,[s.id]:e.target.value})}/>{btn('保存',()=>call(()=>api('/students/'+s.id+'/attendance/'+day,'PATCH',{note:notes[s.id]||''})),'bg-blue-900')}</td><td>{superuser&&btn('調整',()=>openForm({kind:'balance',sid:s.id,remainingClasses:s.remainingClasses,legacyClasses:s.legacyClasses||0,remainingLeaves:s.remainingLeaves,reason:''}),'bg-purple-700')}</td></tr>})}</tbody></table></section>}
+
+    {tab==='students'&&isStaff&&<section className="bg-white p-4 rounded-xl overflow-x-auto"><h2 className="font-bold text-lg mb-3">學員名冊</h2><table className="w-full text-sm"><thead><tr className="bg-slate-100">{['背號','學員','場域','家長登入帳號','登入密碼','方案','剩餘堂數','到期日','操作'].map(x=><th key={x} className="p-3 text-left">{x}</th>)}</tr></thead><tbody>{filtered.map(s=><tr key={s.id} className="border-b"><td>{s.number}</td><td className="font-bold">{s.name}</td><td>{s.campus}</td><td>{s.parentPhone}</td><td className="text-slate-500">不顯示明文密碼{superuser&&btn('重設密碼',()=>openForm({kind:'resetStudentPassword',sid:s.id,studentName:s.name,newPassword:''}),'bg-blue-800 text-white')}{superuser&&btn('啟用家長帳號',()=>call(()=>api('/students/'+s.id+'/activate-parent','POST')),'bg-teal-700 text-white')}</td><td>{s.planType}</td><td>{s.remainingClasses}</td><td>{s.expiryDate}</td><td>{superuser&&btn('刪除學員',async()=>{if(!window.confirm('確定永久刪除「'+s.name+'」？\n將一併刪除點名、續約及家長登入資料，無法復原。'))return;await call(()=>api('/students/'+s.id,'DELETE'))},'bg-red-700 text-white')}</td></tr>)}</tbody></table></section>}
+
+    {tab==='stats'&&isStaff&&<section className="bg-white p-4 rounded-xl"><h2 className="font-bold text-lg">出席率統計</h2>{filtered.map(s=>{let a=s.attendanceHistory.filter(x=>['present','leave','absent'].includes(x.status)),n=a.filter(x=>x.status==='present').length;return <p key={s.id} className="border-b p-3">{s.name}（{s.campus}）：到課 {n}、請假 {a.filter(x=>x.status==='leave').length}、缺席 {a.filter(x=>x.status==='absent').length}，出席率 {a.length?(n/a.length*100).toFixed(1):'0.0'}%</p>})}</section>}
+
+    {tab==='equipment'&&isStaff&&<section className="bg-white p-4 rounded-xl"><h2 className="font-bold text-lg">裝備領用管理</h2>{filtered.map(s=><div key={s.id} className="border-b p-3 flex justify-between"><span>{s.name} #{s.number} — {s.equipment.status}</span>{btn('登記與修改',()=>openForm({kind:'equipment',sid:s.id,equipment:structuredClone(s.equipment)}),'bg-blue-900')}</div>)}</section>}
+
+    {tab==='renewals'&&superuser&&<section className="bg-white p-4 rounded-xl"><h2 className="font-bold text-lg">續約對帳審核</h2>{students.flatMap(s=>s.renewalRequests.filter(r=>r.status==='pending').map(r=><p key={r.id} className="border-b p-3">{s.name} 方案 {r.planType} 匯款末五碼 {r.bankLast5} {r.requestTime}{btn('確認入帳並展延',()=>call(()=>api('/renewals/'+r.id+'/approve','POST')),'bg-green-700')}</p>))}</section>}
+
+    {tab==='admins'&&superuser&&<section className="bg-white p-4 rounded-xl"><h2 className="font-bold text-lg">管理員管理</h2>{btn('新增管理員',()=>openForm({kind:'admin',username:'',name:'',password:''}),'bg-orange-500')}{admins.map(a=><p key={a.id} className="border-b p-3">{a.username} {a.name}（{(a.campuses||[]).join('、')}） {a.active?'啟用':'停用'}{btn('切換狀態',()=>call(()=>api('/admins/'+a.id+'/toggle','PATCH')),'bg-blue-900')}</p>)}</section>}
+  </main>
+
+  {/* ==================== 彈出表單 Modal ==================== */}
+  {form&&<div className="fixed inset-0 bg-slate-900/70 flex items-center justify-center p-4 z-50"><div className="bg-white p-6 rounded-xl max-w-lg w-full max-h-[90vh] overflow-auto">
+    <h2 className="font-black text-xl mb-3">{({announcement:form.id?'編輯公告':'發布新公告',student:'新增學員',equipment:'裝備登記',renewal:'續約申請',balance:'調整堂數',admin:'新增管理員',password:'修改密碼',resetStudentPassword:'重設家長登入密碼'})[form.kind]}</h2>
+    {modalError&&<p role="alert" className="bg-red-50 text-red-700 border border-red-200 p-3 rounded mb-3 text-sm">⚠ {modalError}</p>}
+
+    {/* 公告新增／編輯表單 */}
+    {form.kind==='announcement'&&<>
+      {field('campus','適用學院','text',[
+        ...(canPostAllCampus?[{value:'ALL',label:'全院共用（仁德學院 ＋ 南英學院）'}]:[]),
+        ...userCampuses.map(c=>({value:c,label:c}))
+      ])}
+      {field('audience','公告對象群組','text',[
+        {value:'admin',label:'1. 管理群公告（僅管理員／教練可見）'},
+        {value:'student',label:'2. 學員公告（該學院學員／家長與管理員可見）'},
+        {value:'all',label:'3. 全體公告（管理群 ＋ 學員群皆可見）'}
+      ])}
+      {field('title','公告標題')}
+      <label className="block text-sm mb-3">
+        <span className="font-bold">公告內容</span>
+        <textarea rows="5" className="block border rounded p-2 w-full mt-1" placeholder="請輸入公告詳細內容..." value={form.content||''} onChange={e=>F({...form,content:e.target.value})}></textarea>
+      </label>
+      <label className="flex items-center gap-2 text-sm font-bold mb-4 cursor-pointer">
+        <input type="checkbox" className="w-4 h-4" checked={!!form.pinned} onChange={e=>F({...form,pinned:e.target.checked})}/>
+        <span>📌 置頂此公告（將優先顯示於公告欄最上方）</span>
+      </label>
+    </>}
+
+    {form.kind==='student'&&<>{field('name','學員姓名')}{field('number','背號')}{field('campus','分館','text',userCampuses)}{field('parentName','家長姓名')}{field('parentPhone','家長手機（登入帳號）')}{field('password','初始密碼','password')}{field('studentType','新舊生','text',['新生','舊生'])}{form.studentType==='舊生'&&field('legacyClasses','舊生原本剩餘堂數','number')}{field('planType','方案','text',['A','B'])}{field('purchaseDate','生效日期','date')}<div className="border-t mt-3 pt-3"><h3 className="font-bold text-blue-950 mb-2">新學員裝備尺寸（可先選尺寸，領用狀態預設未領）</h3>{Object.entries(labels).map(([k,v])=><div key={k} className="flex items-center gap-2 mb-2"><span className="w-20 text-sm">{v}</span>{['jersey','pants','practiceShirt'].includes(k)?<select className="border rounded p-2 flex-1" value={form.equipment?.[k]?.size||''} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],size:e.target.value}}})}>{['','110','120','130','140','150','160','XS','S','M','L','XL','2XL','3XL'].map(v=><option key={v} value={v}>{v||'尚未選擇'}</option>)}</select>:<span className="text-slate-500 text-sm">不需尺寸</span>}</div>)}</div><p className="text-xs text-slate-600">密碼至少10碼，需包含大寫、小寫、數字及特殊符號。家長手機不可與既有帳號重複。</p></>}
+
+    {form.kind==='equipment'&&Object.entries(labels).map(([k,v])=><div key={k} className="border-b p-2"><strong>{v}</strong><input className="border p-2 w-24 ml-3" placeholder="尺寸" value={form.equipment[k]?.size||''} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],size:e.target.value}}})}/><label className="ml-2"><input type="checkbox" checked={!!form.equipment[k]?.issued} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],issued:e.target.checked}}})}/> 已領</label><input type="date" className="border p-1 ml-2" value={form.equipment[k]?.date||''} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],date:e.target.value}}})}/></div>)}
+
+    {form.kind==='renewal'&&<>{field('planType','續約方案','text',['A','B'])}{field('bankLast5','匯款帳號末五碼')}</>}
+    {form.kind==='balance'&&<>{field('remainingClasses','總剩餘堂數','number')}{field('legacyClasses','其中舊生原本剩餘堂數','number')}{field('remainingLeaves','剩餘請假','number')}{field('reason','調整原因')}</>}
+    {form.kind==='admin'&&<>{field('username','管理員帳號')}{field('name','姓名')}{field('password','初始密碼','password')}</>}
+    {form.kind==='password'&&<>{field('oldPassword','舊密碼','password')}{field('newPassword','新密碼','password')}</>}
+    {form.kind==='resetStudentPassword'&&<><p className="text-sm mb-2">學員：{form.studentName}。設定新密碼後，該家長所有登入工作階段將失效。</p>{field('newPassword','新密碼（至少10碼，大小寫、數字、特殊符號）','password')}</>}
+
+    <div className="mt-4">
+      {btn('取消',()=>F(null),'bg-slate-500')}
+      {btn('確認保存',()=>call(async()=>{
+        let k=form.kind;
+        if(k==='announcement'){
+          if(!form.title?.trim()||!form.content?.trim())throw Error('請填寫公告標題與內容');
+          const payload={campus:form.campus,audience:form.audience,title:form.title,content:form.content,pinned:!!form.pinned};
+          if(form.id)await api('/announcements/'+form.id,'PATCH',payload);
+          else await api('/announcements','POST',payload);
+        }
+        if(k==='student'||k==='admin'){
+          if(!form.name?.trim())throw Error('請填寫姓名');
+          if(k==='student'&&(!form.parentPhone?.trim()||!form.purchaseDate))throw Error('請填寫家長手機與生效日期');
+          if(k==='admin'&&!form.username?.trim())throw Error('請填寫管理員帳號');
+          if(!/^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{10,}$/.test(form.password||''))throw Error('初始密碼至少10碼，必須包含英文大小寫、數字及特殊符號');
+        }
+        if(k==='student'){
+          const body={...form};
+          if(body.studentType==='舊生')body.legacyClasses=Number(body.legacyClasses||0);
+          else body.legacyClasses=null;
+          body.remainingLeaves=null;
+          await api('/students','POST',body);
+        }
+        if(k==='equipment')await api('/students/'+form.sid+'/equipment','PUT',{equipment:form.equipment});
+        if(k==='renewal')await api('/students/'+form.sid+'/renewals','POST',{planType:form.planType,bankLast5:form.bankLast5});
+        if(k==='balance')await api('/students/'+form.sid+'/balance','PATCH',{remainingClasses:Number(form.remainingClasses),legacyClasses:Number(form.legacyClasses||0),remainingLeaves:Number(form.remainingLeaves),reason:form.reason});
+        if(k==='admin')await api('/admins','POST',form);
+        if(k==='password')await api('/password','POST',form);
+        if(k==='resetStudentPassword'){
+          if(!/^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{10,}$/.test(form.newPassword||''))throw Error('新密碼至少10碼，需包含英文大小寫、數字及特殊符號');
+          await api('/students/'+form.sid+'/reset-password','POST',{newPassword:form.newPassword});
+        }
+        F(null);ME('');
+      }),'bg-blue-950 text-white')}
     </div>
-  </div>
-);
-const annTargetChoices=superuser?['ALL',...ALL_CAMPUSES]:(allowedCampuses.length>1?['ALL',...allowedCampuses]:allowedCampuses);
-return <><header className="bg-[#0B2545] text-white p-4 flex flex-wrap gap-3 items-center justify-between"><div className="flex items-center gap-3"><img src="/static/logo.jpg" className="w-12 h-12 rounded-full"/><div><h1 className="font-black text-xl">魔法棒球學院</h1><p className="text-xs">課務點名與方案管理系統</p></div></div><div className="flex flex-wrap items-center gap-1"><span>{user.name}（{user.role}{user.role==='admin'?'｜'+allowedCampuses.join('、'):''}）</span>{btn('修改密碼',()=>openForm({kind:'password',oldPassword:'',newPassword:''}),'bg-blue-700')}{btn('登出',()=>call(async()=>{await api('/logout','POST');U(null);S([]);A([]);ANN([]);PA([]);SP({})}),'bg-red-600')}</div></header><main className="max-w-7xl mx-auto p-4"><nav className="bg-[#0B2545] rounded-xl p-3 flex flex-wrap gap-2 mb-4">{user.role!=='parent'&&['checkin','students','stats','equipment','announcements',...(superuser?['renewals','admins']:[])].map((x,i)=>btn(['⚾ 點名','👥 學員','📊 統計','👕 裝備','📢 公告管理','💳 續約審核','⚙️ 管理員'][i],()=>T(x),tab===x?'bg-amber-400 text-blue-950':'bg-slate-700 text-white'))}{user.role!=='parent'&&btn('＋新增學員',()=>openForm({kind:'student',name:'',number:'',campus:allowedCampuses[0]||'仁德學院',parentName:'',parentPhone:'',password:'',studentType:'新生',planType:'A',purchaseDate:day,legacyClasses:'',remainingLeaves:'',equipment:Object.fromEntries(Object.keys(labels).map(k=>[k,{size:'',issued:false,date:''}]))}),'bg-orange-400 text-blue-950')}{user.role!=='parent'&&btn('Excel 匯出',()=>window.location.href='/api/export.xlsx','bg-green-700')}{user.role!=='parent'&&btn('下載匯入範本',()=>window.location.href='/api/students/import-template.xlsx','bg-sky-700')}{user.role!=='parent'&&<label className="inline-block rounded px-3 py-2 text-sm font-bold m-1 bg-indigo-700 text-white cursor-pointer">📥 Excel 批次匯入<input type="file" accept=".xlsx" className="hidden" onChange={async e=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;if(!window.confirm('確定匯入 '+file.name+'？重複帳號或格式錯誤時整批不匯入。'))return;try{const res=await fetch('/api/students/import.xlsx',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},body:await file.arrayBuffer()});const data=await res.json().catch(()=>({}));if(!res.ok)throw Error(data.detail||'匯入失敗');M(data.message||'匯入完成');await refresh();T('students')}catch(err){M('⚠ Excel 匯入失敗：'+err.message)}}}/></label>}{user.role!=='parent'&&<select value={campus} onChange={e=>C(e.target.value)} className="p-2 rounded">{[...(allowedCampuses.length>1?['ALL']:[]),...allowedCampuses].map(x=><option key={x} value={x}>{x==='ALL'?'全部授權學院':x}</option>)}</select>}</nav>{msg&&<p className="p-2 bg-white mb-3 rounded" onClick={()=>M('')}>{msg}（點此關閉）</p>}
-{user.role==='parent'&&<><section className="bg-white p-5 rounded-xl mb-4 border-l-4 border-amber-500 shadow-sm"><div className="flex items-center justify-between mb-3"><h2 className="text-lg font-black text-blue-950">📢 學院最新公告</h2><span className="text-xs text-slate-500">共 {announcements.length} 則公告</span></div>{announcements.length===0?<p className="text-sm text-slate-500 py-2">目前尚無最新公告。</p>:<ul className="divide-y">{announcements.map(ann=><li key={ann.id} className="py-3"><div className="flex flex-wrap items-center gap-2 mb-1">{ann.pinned&&<span className="bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded">置頂</span>}<span className="bg-sky-100 text-sky-900 text-xs font-bold px-2 py-0.5 rounded">{ann.campus==='ALL'?'全學院公告':ann.campus}</span><strong className="text-base text-slate-900">{ann.title}</strong><span className="text-xs text-slate-400 ml-auto">{ann.createdAt}</span></div><p className="text-sm text-slate-700 whitespace-pre-line leading-relaxed pl-1">{ann.content}</p></li>)}</ul>}</section>{students.map(s=><section key={s.id} className="bg-white p-5 rounded-xl mb-4"><h2 className="text-xl font-black">{s.name} #{s.number}</h2><p>{s.campus}｜方案 {s.planType}｜到期 {s.expiryDate}</p><p className="my-3">剩餘堂數：{s.remainingClasses}/{s.totalClasses}{s.legacyClasses>0&&<span className="ml-2 text-xs bg-amber-100 text-amber-900 px-2 py-1 rounded font-bold">含原本剩餘 {s.legacyClasses} 堂（不限期，優先扣除）</span>}｜剩餘請假：{s.remainingLeaves}/{s.totalLeaves}</p>{btn('線上續約',()=>openForm({kind:'renewal',sid:s.id,planType:'A',bankLast5:''}),'bg-orange-500')}<h3 className="font-bold mt-4">出席紀錄與教練評語</h3>{s.attendanceHistory.map(a=><p key={a.id} className="border-b py-2">{a.date} {a.status} {a.note}</p>)}<h3 className="font-bold mt-4">裝備領用</h3>{Object.entries(labels).map(([k,v])=><p key={k}>{v}：{s.equipment[k]?.issued?'已領':'未領'} {s.equipment[k]?.size}</p>)}<h3 className="font-bold mt-4">續約紀錄</h3>{s.renewalRequests.map(r=><p key={r.id}>{r.requestTime} 方案{r.planType} {r.status}</p>)}</section>)}</>}
-{tab==='checkin'&&user.role!=='parent'&&<section className="bg-white p-4 rounded-xl overflow-x-auto"><h2 className="font-bold text-lg">⚾ 快捷點名與評語</h2><div className="flex flex-wrap items-center gap-3 my-3"><span className="bg-emerald-100 text-emerald-900 font-bold rounded-lg px-4 py-2">當日實際到課：{presentCount} 人</span><label className="flex items-center gap-2"><input type="checkbox" checked={onlyPresent} onChange={e=>OP(e.target.checked)}/>僅顯示到課學員</label><span className="text-sm text-slate-500">依日期及目前選擇分館統計（不含請假、缺席）</span></div><label>點名日期 <input type="date" className="border p-2" value={day} onChange={e=>D(e.target.value)}/></label><table className="w-full text-sm mt-4"><thead><tr className="bg-slate-100">{['學員','剩餘堂數','點名狀態','教練評語','調整'].map(x=><th className="p-2 text-left">{x}</th>)}</tr></thead><tbody>{checkinStudents.map(s=>{let a=s.attendanceHistory.find(x=>x.date===day);return <tr className="border-b" key={s.id}><td className="p-2 font-bold">{s.name} #{s.number}<p className="text-xs">{s.campus}</p></td><td>{s.remainingClasses}/{s.totalClasses}{s.legacyClasses>0&&<p className="text-xs text-amber-800 font-bold">原本剩餘：{s.legacyClasses} 堂（優先扣）</p>}</td><td>{a?<>{a.status}{a.status!=='leave'&&<span className="ml-1 text-xs text-slate-500">({a.deductedFrom==='legacy'?'扣原本堂數':'扣新購方案'})</span>}{btn('取消點名',()=>call(()=>api('/students/'+s.id+'/attendance/'+day,'DELETE')),'bg-red-600')}</>:['present','leave','absent'].map((x,i)=>btn(['到課','請假','缺席'][i],()=>call(()=>api('/students/'+s.id+'/attendance','POST',{date:day,status:x,note:notes[s.id]||''})),['bg-green-600','bg-amber-500','bg-red-600'][i]+' text-white'))}</td><td><input className="border p-2" placeholder={a?.note||'教練評語'} value={notes[s.id]||''} onChange={e=>N({...notes,[s.id]:e.target.value})}/>{btn('保存',()=>call(()=>api('/students/'+s.id+'/attendance/'+day,'PATCH',{note:notes[s.id]||''})),'bg-blue-900')}</td><td>{superuser&&btn('調整',()=>openForm({kind:'balance',sid:s.id,remainingClasses:s.remainingClasses,legacyClasses:s.legacyClasses||0,remainingLeaves:s.remainingLeaves,reason:''}),'bg-purple-700')}</td></tr>})}</tbody></table></section>}
-{tab==='students'&&user.role!=='parent'&&<section className="bg-white p-4 rounded-xl overflow-x-auto"><h2 className="font-bold text-lg mb-3">學員名冊</h2><table className="w-full text-sm"><thead><tr className="bg-slate-100">{['背號','學員','場域','家長登入帳號','登入密碼','方案','剩餘堂數','到期日','操作'].map(x=><th className="p-3 text-left">{x}</th>)}</tr></thead><tbody>{filtered.map(s=><tr className="border-b"><td>{s.number}</td><td className="font-bold">{s.name}<span className="ml-1 text-xs text-slate-500">({s.studentType})</span></td><td>{s.campus}</td><td>{s.parentPhone}</td><td className="text-slate-500">不顯示明文密碼{superuser&&btn('重設密碼',()=>openForm({kind:'resetStudentPassword',sid:s.id,studentName:s.name,newPassword:''}),'bg-blue-800 text-white')}{superuser&&btn('啟用家長帳號',()=>call(()=>api('/students/'+s.id+'/activate-parent','POST')),'bg-teal-700 text-white')}</td><td>{s.planType}</td><td>{s.remainingClasses}{s.legacyClasses>0&&<p className="text-xs text-amber-800 font-bold">含原本剩餘 {s.legacyClasses} 堂</p>}</td><td>{s.expiryDate}</td><td>{superuser&&btn('刪除學員',async()=>{if(!window.confirm('確定永久刪除「'+s.name+'」？\n將一併刪除點名、續約及家長登入資料，無法復原。'))return;await call(()=>api('/students/'+s.id,'DELETE'))},'bg-red-700 text-white')}</td></tr>)}</tbody></table></section>}
-{tab==='stats'&&user.role!=='parent'&&<section className="bg-white p-4 rounded-xl"><h2 className="font-bold text-lg">出席率統計</h2>{filtered.map(s=>{let a=s.attendanceHistory.filter(x=>['present','leave','absent'].includes(x.status)),n=a.filter(x=>x.status==='present').length;return <p className="border-b p-3">{s.name}（{s.campus}）：到課 {n}、請假 {a.filter(x=>x.status==='leave').length}、缺席 {a.filter(x=>x.status==='absent').length}，出席率 {a.length?(n/a.length*100).toFixed(1):'0.0'}%</p>})}</section>}
-{tab==='equipment'&&user.role!=='parent'&&<section className="bg-white p-4 rounded-xl"><h2 className="font-bold text-lg">裝備領用管理</h2>{filtered.map(s=><div className="border-b p-3 flex justify-between"><span>{s.name} #{s.number} — {s.equipment.status}</span>{btn('登記與修改',()=>openForm({kind:'equipment',sid:s.id,equipment:structuredClone(s.equipment)}),'bg-blue-900')}</div>)}</section>}
-{tab==='announcements'&&user.role!=='parent'&&<section className="bg-white p-4 rounded-xl"><div className="flex flex-wrap items-center justify-between gap-2 mb-3"><h2 className="font-bold text-lg">📢 公告發佈與管理（家長登入可見）</h2>{btn('＋發佈新公告',()=>openForm({kind:'announcement',title:'',content:'',campus:annTargetChoices[0]||'ALL',pinned:false}),'bg-orange-500 text-blue-950')}</div>{announcements.length===0?<p className="text-sm text-slate-500 p-4">目前尚未發佈任何公告。</p>:<div className="divide-y">{announcements.map(ann=><div key={ann.id} className="p-3 flex flex-wrap items-start justify-between gap-3"><div className="flex-1 min-w-[240px]"><div className="flex flex-wrap items-center gap-2 mb-1">{ann.pinned&&<span className="bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded">置頂</span>}<span className="bg-sky-100 text-sky-900 text-xs font-bold px-2 py-0.5 rounded">{ann.campus==='ALL'?'全部學院':ann.campus}</span><strong className="text-base">{ann.title}</strong><span className="text-xs text-slate-500">發佈者：{ann.author}｜{ann.createdAt}</span></div><p className="text-sm text-slate-700 whitespace-pre-line">{ann.content}</p></div><div>{btn('刪除公告',async()=>{if(!window.confirm('確定刪除公告「'+ann.title+'」？'))return;await call(()=>api('/announcements/'+ann.id,'DELETE'))},'bg-red-700 text-white')}</div></div>)}</div>}</section>}
-{tab==='renewals'&&superuser&&<section className="bg-white p-4 rounded-xl"><h2 className="font-bold text-lg">續約對帳審核</h2>{students.flatMap(s=>s.renewalRequests.filter(r=>r.status==='pending').map(r=><p className="border-b p-3">{s.name} 方案 {r.planType} 匯款末五碼 {r.bankLast5} {r.requestTime}{btn('確認入帳並展延',()=>call(()=>api('/renewals/'+r.id+'/approve','POST')),'bg-green-700')}</p>))}</section>}
-{tab==='admins'&&superuser&&<section className="bg-white p-4 rounded-xl overflow-x-auto"><div className="flex flex-wrap items-center justify-between gap-2 mb-3"><h2 className="font-bold text-lg">⚙️ 管理員管理</h2>{btn('＋新增管理員',()=>openForm({kind:'admin',username:'',name:'',password:'',campuses:[...ALL_CAMPUSES]}),'bg-orange-500 text-blue-950')}</div><table className="w-full text-sm"><thead><tr className="bg-slate-100">{['管理員帳號','姓名','管理員密碼','可管理的學院','狀態','操作'].map(x=><th key={x} className="p-3 text-left">{x}</th>)}</tr></thead><tbody>{admins.map(a=>{const pwdKey='adm_'+a.id;const hasPwd=!!a.password;return <tr key={a.id} className="border-b"><td className="p-3 font-bold">{a.username}</td><td className="p-3">{a.name}</td><td className="p-3 font-mono">{hasPwd?<span className="inline-flex items-center gap-2"><span>{showPwd[pwdKey]?a.password:'••••••••••'}</span><button type="button" onClick={()=>togglePwd(pwdKey)} className="px-2 py-1 text-xs font-sans font-bold rounded bg-slate-200 hover:bg-slate-300 text-slate-800">{showPwd[pwdKey]?'🙈 隱藏':'👁 顯示密碼'}</button></span>:<span className="text-slate-400 font-sans text-xs">舊帳號未記錄（請重設密碼）</span>}</td><td className="p-3">{(a.campuses||ALL_CAMPUSES).map(c=><span key={c} className="inline-block bg-sky-100 text-sky-900 text-xs font-bold px-2 py-1 rounded mr-1">{c}</span>)}</td><td className="p-3">{a.active?<span className="text-emerald-700 font-bold">啟用</span>:<span className="text-red-600 font-bold">停用</span>}</td><td className="p-3">{btn('管理學院',()=>openForm({kind:'editAdminCampuses',aid:a.id,username:a.username,name:a.name,campuses:[...(a.campuses||ALL_CAMPUSES)]}),'bg-sky-700')}{btn('重設密碼',()=>openForm({kind:'resetAdminPassword',aid:a.id,username:a.username,name:a.name,newPassword:''}),'bg-indigo-700')}{btn('切換狀態',()=>call(()=>api('/admins/'+a.id+'/toggle','PATCH')),'bg-blue-900')}{btn('刪除管理員',async()=>{if(!window.confirm('確定永久刪除管理員「'+a.name+'（'+a.username+'）」？\n刪除後將立即登出並無法復原。'))return;await call(()=>api('/admins/'+a.id,'DELETE'))},'bg-red-700 text-white')}</td></tr>})}</tbody></table></section>}
-</main>
-{parentAlerts.length>0&&<div className="fixed inset-0 bg-slate-900/75 flex items-center justify-center p-4 z-50"><div className="bg-white p-6 rounded-2xl max-w-lg w-full shadow-2xl border-t-8 border-amber-500"><div className="flex items-center gap-2 mb-3"><span className="text-2xl">⚠️</span><h2 className="font-black text-xl text-blue-950">課務與續約重要提醒</h2></div><div className="space-y-3 mb-5 max-h-[60vh] overflow-auto">{parentAlerts.map((al,idx)=><div key={idx} className={'p-3 rounded-lg border '+(al.type==='low_classes'?'bg-red-50 border-red-200 text-red-900':'bg-amber-50 border-amber-200 text-amber-950')}><p className="font-bold text-sm mb-1">{al.title}</p><p className="text-xs leading-relaxed">{al.desc}</p></div>)}</div><div className="flex flex-wrap justify-end gap-2">{btn('立即線上續約',()=>{const targetSid=parentAlerts[0]?.sid||students[0]?.id;PA([]);if(targetSid)openForm({kind:'renewal',sid:targetSid,planType:'A',bankLast5:''})},'bg-orange-500 text-blue-950')}{btn('我知道了',()=>PA([]),'bg-blue-950 text-white')}</div></div></div>}
-{form&&<div className="fixed inset-0 bg-slate-900/70 flex items-center justify-center p-4 z-50"><div className="bg-white p-6 rounded-xl max-w-lg w-full max-h-[90vh] overflow-auto"><h2 className="font-black text-xl mb-3">{({student:'新增學員',equipment:'裝備登記',renewal:'續約申請',balance:'調整堂數',announcement:'發佈新公告',admin:'新增管理員',editAdminCampuses:'設定管理員可管理的學院',resetAdminPassword:'重設管理員密碼',password:'修改密碼',resetStudentPassword:'重設家長登入密碼'})[form.kind]}</h2>{modalError&&<p role="alert" className="bg-red-50 text-red-700 border border-red-200 p-3 rounded mb-3 text-sm">⚠ {modalError}</p>}{form.kind==='student'&&<>{field('name','學員姓名')}{field('number','背號')}{field('campus','分館','text',allowedCampuses)}{field('parentName','家長姓名')}{field('parentPhone','家長手機（登入帳號）')}{field('password','初始密碼','password')}{field('studentType','新舊生','text',['新生','舊生'])}{field('planType','方案','text',['A','B'])}{field('purchaseDate',form.studentType==='舊生'?'建檔日期':'購買生效日期','date')}{form.studentType==='舊生'&&<div className="bg-amber-50 border border-amber-200 p-3 rounded mb-3"><p className="text-xs font-bold text-amber-900 mb-2">舊生原本剩餘堂數（不計算到期日；後續新購方案時才開始計算到期日，且上課優先扣除原本堂數）</p>{field('legacyClasses','原本剩餘堂數','number')}{field('remainingLeaves','原本剩餘請假（選填，留空依方案預設）','number')}</div>}<div className="border-t mt-3 pt-3"><h3 className="font-bold text-blue-950 mb-2">新學員裝備尺寸（可先選尺寸，領用狀態預設未領）</h3>{Object.entries(labels).map(([k,v])=><div key={k} className="flex items-center gap-2 mb-2"><span className="w-20 text-sm">{v}</span>{['jersey','pants','practiceShirt'].includes(k)?<select className="border rounded p-2 flex-1" value={form.equipment?.[k]?.size||''} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],size:e.target.value}}})}>{['','110','120','130','140','150','160','XS','S','M','L','XL','2XL','3XL'].map(v=><option key={v} value={v}>{v||'尚未選擇'}</option>)}</select>:<span className="text-slate-500 text-sm">不需尺寸</span>}</div>)}</div><p className="text-xs text-slate-600">密碼至少10碼，需包含大寫、小寫、數字及特殊符號。家長手機不可與既有帳號重複。</p></>}{form.kind==='equipment'&&Object.entries(labels).map(([k,v])=><div className="border-b p-2"><strong>{v}</strong><input className="border p-2 w-24 ml-3" placeholder="尺寸" value={form.equipment[k]?.size||''} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],size:e.target.value}}})}/><label className="ml-2"><input type="checkbox" checked={!!form.equipment[k]?.issued} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],issued:e.target.checked}}})}/> 已領</label><input type="date" className="border p-1 ml-2" value={form.equipment[k]?.date||''} onChange={e=>F({...form,equipment:{...form.equipment,[k]:{...form.equipment[k],date:e.target.value}}})}/></div>)}{form.kind==='renewal'&&<>{field('planType','續約方案','text',['A','B'])}{field('bankLast5','匯款帳號末五碼')}</>}{form.kind==='balance'&&<>{field('remainingClasses','總剩餘堂數（含原本剩餘堂數）','number')}{field('legacyClasses','其中：舊生原本剩餘堂數（優先扣除）','number')}{field('remainingLeaves','剩餘請假','number')}{field('reason','調整原因')}</>}{form.kind==='announcement'&&<><label className="block text-sm mb-2"><span className="font-bold">公告對象學院</span><select className="block border rounded p-2 w-full" value={form.campus||'ALL'} onChange={e=>F({...form,campus:e.target.value})}>{annTargetChoices.map(x=><option key={x} value={x}>{x==='ALL'?'全部學院':x}</option>)}</select></label>{field('title','公告標題')}{field('content','公告內容','textarea')}<label className="flex items-center gap-2 text-sm font-bold mb-3 cursor-pointer"><input type="checkbox" checked={!!form.pinned} onChange={e=>F({...form,pinned:e.target.checked})}/>置頂此公告（優先顯示在最上方）</label></>}{form.kind==='admin'&&<>{field('username','管理員帳號')}{field('name','姓名')}{field('password','初始密碼（至少10碼，大小寫、數字、特殊符號）','password')}{campusCheckboxes()}</>}{form.kind==='editAdminCampuses'&&<><p className="text-sm mb-3">管理員：<strong>{form.name}（{form.username}）</strong></p>{campusCheckboxes()}</>}{form.kind==='resetAdminPassword'&&<><p className="text-sm mb-2">管理員：<strong>{form.name}（{form.username}）</strong>。重設後該管理員將需重新登入。</p>{field('newPassword','新密碼（至少10碼，大小寫、數字、特殊符號）','password')}</>}{form.kind==='password'&&<>{field('oldPassword','舊密碼','password')}{field('newPassword','新密碼','password')}</>}{form.kind==='resetStudentPassword'&&<><p className="text-sm mb-2">學員：{form.studentName}。設定新密碼後，該家長所有登入工作階段將失效。</p>{field('newPassword','新密碼（至少10碼，大小寫、數字、特殊符號）','password')}</>}{btn('取消',()=>openForm(null),'bg-slate-500')}{btn('確認保存',()=>call(async()=>{let k=form.kind;if(k==='student'||k==='admin'){if(!form.name?.trim())throw Error('請填寫姓名');if(k==='student'&&(!form.parentPhone?.trim()||!form.purchaseDate))throw Error('請填寫家長手機與日期');if(k==='student'&&form.studentType==='舊生'&&(form.legacyClasses===''||form.legacyClasses===null||Number(form.legacyClasses)<0))throw Error('舊生請填寫原本剩餘堂數（0 以上整數）');if(k==='admin'&&!form.username?.trim())throw Error('請填寫管理員帳號');if(k==='admin'&&(!form.campuses||form.campuses.length===0))throw Error('請至少勾選一個可管理的學院');if(!/^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{10,}$/.test(form.password||''))throw Error('初始密碼至少10碼，必須包含英文大小寫、數字及特殊符號');}if(k==='student'){const payload={...form,legacyClasses:form.studentType==='舊生'?Number(form.legacyClasses):null,remainingLeaves:(form.studentType==='舊生'&&form.remainingLeaves!==''&&form.remainingLeaves!==null)?Number(form.remainingLeaves):null};await api('/students','POST',payload)}if(k==='equipment')await api('/students/'+form.sid+'/equipment','PUT',{equipment:form.equipment});if(k==='renewal')await api('/students/'+form.sid+'/renewals','POST',{planType:form.planType,bankLast5:form.bankLast5});if(k==='balance')await api('/students/'+form.sid+'/balance','PATCH',{remainingClasses:Number(form.remainingClasses),legacyClasses:Number(form.legacyClasses||0),remainingLeaves:Number(form.remainingLeaves),reason:form.reason});if(k==='announcement'){if(!form.title?.trim()||!form.content?.trim())throw Error('請填寫公告標題與內容');await api('/announcements','POST',{title:form.title,content:form.content,campus:form.campus,pinned:!!form.pinned})}if(k==='admin')await api('/admins','POST',{username:form.username,name:form.name,password:form.password,campuses:form.campuses});if(k==='editAdminCampuses'){if(!form.campuses||form.campuses.length===0)throw Error('請至少勾選一個可管理的學院');await api('/admins/'+form.aid,'PATCH',{campuses:form.campuses})}if(k==='resetAdminPassword'){if(!/^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{10,}$/.test(form.newPassword||''))throw Error('新密碼至少10碼，需包含英文大小寫、數字及特殊符號');await api('/admins/'+form.aid,'PATCH',{newPassword:form.newPassword})}if(k==='password')await api('/password','POST',form);if(k==='resetStudentPassword'){if(!/^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{10,}$/.test(form.newPassword||''))throw Error('新密碼至少10碼，需包含英文大小寫、數字及特殊符號');await api('/students/'+form.sid+'/reset-password','POST',{newPassword:form.newPassword})};openForm(null)}),'bg-blue-950 text-white')}</div></div>}</>}
+  </div></div>}
+  </>;
+}
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 </script></body></html>
