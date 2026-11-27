@@ -18,6 +18,7 @@ engine=create_engine(os.environ['DATABASE_URL'].replace('postgres://','postgresq
 
 NO_EXPIRY_LABEL='不限期（未購新方案）'
 ALL_CAMPUSES=['仁德學院','南英學院']
+ALL_AUDIENCES=['admin','student','all']
 
 def clean_text(raw)->str:
  if raw is None:return ''
@@ -58,6 +59,9 @@ def is_valid_iso_date(s:str)->bool:
 def tw_today()->str:
  return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
 
+def tw_now_str()->str:
+ return datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+
 def now():return datetime.now(timezone.utc)
 def uid():return secrets.token_hex(12)
 def digest(t):return hashlib.sha256(t.encode()).hexdigest()
@@ -90,7 +94,7 @@ class Attendance(Base):
 class Renewal(Base):
  __tablename__='renewals';id=Column(String,primary_key=True,default=uid);student_id=Column(String,ForeignKey('students.id'));planType=Column(String);bankLast5=Column(String);requestTime=Column(String);status=Column(String);confirmTime=Column(String);prevExpiryDate=Column(String);newExpiryDate=Column(String)
 class Announcement(Base):
- __tablename__='announcements';id=Column(String,primary_key=True,default=uid);title=Column(String);content=Column(String);campus=Column(String,default='ALL');pinned=Column(Boolean,default=False);author=Column(String);createdAt=Column('created_at',String)
+ __tablename__='announcements';id=Column(String,primary_key=True,default=uid);title=Column(String);content=Column(String);campus=Column(String,default='ALL');audience=Column('audience',String,default='all');pinned=Column(Boolean,default=False);author=Column(String);createdAt=Column('created_at',String)
 class Audit(Base):
  __tablename__='audit';id=Column(String,primary_key=True,default=uid);actor=Column(String);action=Column(String);student_id=Column(String);detail=Column(String);time=Column(DateTime(timezone=True),default=now)
 class SessionToken(Base):
@@ -106,6 +110,8 @@ def ensure_schema():
   conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_plain VARCHAR DEFAULT ''"))
   conn.execute(text("UPDATE users SET password_plain = '' WHERE password_plain IS NULL"))
   conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS campuses JSON"))
+  conn.execute(text("ALTER TABLE announcements ADD COLUMN IF NOT EXISTS audience VARCHAR DEFAULT 'all'"))
+  conn.execute(text("UPDATE announcements SET audience = 'all' WHERE audience IS NULL OR audience = ''"))
 
 def dbdep():
  with Session() as db:yield db
@@ -176,7 +182,8 @@ async def protect_mutations(request:Request,call_next):
     return Response('Origin not allowed',status_code=403)
  return await call_next(request)
 
-app.mount('/static',StaticFiles(directory=P/'static'),name='static')
+(P/'static').mkdir(exist_ok=True)
+app.mount('/static',StaticFiles(directory=P/'static',check_dir=False),name='static')
 
 @app.get('/healthz')
 def healthz():
@@ -184,7 +191,10 @@ def healthz():
  return {'status':'ok'}
 
 @app.get('/')
-def index():return FileResponse(P/'static'/'index.html')
+def index():
+ target=P/'static'/'index.html'
+ if not target.exists() and (P/'index.html').exists():target=P/'index.html'
+ return FileResponse(target)
 
 class Login(BaseModel):username:str;password:str
 @app.post('/api/login')
@@ -208,22 +218,49 @@ def logout(request:Request,response:Response,db=Depends(dbdep)):
 @app.get('/api/me')
 def me(u=Depends(auth)):return {'role':u.role,'name':u.name,'username':u.username,'campuses':user_campuses(u)}
 
+# ==================== 公告系統（分館 × 群組 × 置頂） ====================
+def validate_announcement_scope(u,campus_raw:str,audience_raw:str):
+ aud=clean_text(audience_raw) or 'all'
+ if aud not in ALL_AUDIENCES:
+  raise HTTPException(400,'公告群組錯誤（須為 admin、student 或 all）')
+ target=clean_text(campus_raw) or 'ALL'
+ if target=='ALL':
+  if u.role=='admin':
+   ac=user_campuses(u)
+   if len(ac)<len(ALL_CAMPUSES):
+    target=ac[0]
+ elif target not in ALL_CAMPUSES:
+  raise HTTPException(400,'學院選擇錯誤（須為 ALL、仁德學院 或 南英學院）')
+ elif u.role=='admin' and target not in user_campuses(u):
+  raise HTTPException(403,f'您沒有「{target}」的公告發佈權限')
+ return target,aud
+
 @app.get('/api/announcements')
 def list_announcements(db=Depends(dbdep),u=Depends(auth)):
  rows=db.scalars(select(Announcement).order_by(Announcement.pinned.desc(),Announcement.createdAt.desc())).all()
  if u.role=='parent':
   st=db.get(Student,u.student_id)
   sc=st.campus if st else ''
-  rows=[r for r in rows if r.campus in ('ALL',sc)]
+  rows=[r for r in rows if (r.campus in ('ALL',sc)) and ((r.audience or 'all') in ('student','all'))]
  elif u.role=='admin':
   ac=user_campuses(u)
   rows=[r for r in rows if r.campus in ('ALL',*ac)]
- return [{'id':r.id,'title':r.title,'content':r.content,'campus':r.campus,'pinned':bool(r.pinned),'author':r.author,'createdAt':r.createdAt} for r in rows]
+ return [{
+  'id':r.id,
+  'title':r.title,
+  'content':r.content,
+  'campus':r.campus or 'ALL',
+  'audience':r.audience or 'all',
+  'pinned':bool(r.pinned),
+  'author':r.author or '',
+  'createdAt':r.createdAt or ''
+ } for r in rows]
 
 class AnnouncementIn(BaseModel):
  title:str
  content:str
  campus:str='ALL'
+ audience:str='all'
  pinned:bool=False
 
 @app.post('/api/announcements')
@@ -233,21 +270,49 @@ def create_announcement(p:AnnouncementIn,db=Depends(dbdep),u=Depends(auth)):
  content=(p.content or '').strip()
  if not title or not content:
   raise HTTPException(400,'請填寫公告標題與內容')
- ac=user_campuses(u)
- target=p.campus or 'ALL'
- if target=='ALL':
-  if u.role=='admin' and len(ac)<len(ALL_CAMPUSES):
-   target=ac[0]
- elif target not in ALL_CAMPUSES:
-  raise HTTPException(400,'學院選擇錯誤')
- elif u.role=='admin' and target not in ac:
-  raise HTTPException(403,f'您沒有「{target}」的公告發佈權限')
- tw_now=datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
- ann=Announcement(title=title,content=content,campus=target,pinned=bool(p.pinned),author=u.name or u.username,createdAt=tw_now)
+ target,aud=validate_announcement_scope(u,p.campus,p.audience)
+ ann=Announcement(title=title[:120],content=content[:3000],campus=target,audience=aud,pinned=bool(p.pinned),author=u.name or u.username,createdAt=tw_now_str())
  db.add(ann)
- log(db,u,'add_announcement',detail=f'{target}: {title}')
+ log(db,u,'add_announcement',detail=f'{target}/{aud}: {title[:30]}')
  db.commit()
  return {'id':ann.id}
+
+@app.patch('/api/announcements/{aid}')
+def update_announcement(aid:str,p:AnnouncementIn,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'admin','superadmin')
+ ann=db.get(Announcement,aid)
+ if not ann:raise HTTPException(404,'公告不存在')
+ if u.role=='admin':
+  ac=user_campuses(u)
+  if ann.campus not in ac and ann.author not in (u.name,u.username):
+   raise HTTPException(403,'無權編輯此公告')
+ title=clean_text(p.title)
+ content=(p.content or '').strip()
+ if not title or not content:
+  raise HTTPException(400,'請填寫公告標題與內容')
+ target,aud=validate_announcement_scope(u,p.campus,p.audience)
+ ann.title=title[:120]
+ ann.content=content[:3000]
+ ann.campus=target
+ ann.audience=aud
+ ann.pinned=bool(p.pinned)
+ log(db,u,'update_announcement',detail=f'{target}/{aud}: {title[:30]}')
+ db.commit()
+ return {'ok':True}
+
+@app.patch('/api/announcements/{aid}/pin')
+def toggle_pin_announcement(aid:str,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'admin','superadmin')
+ ann=db.get(Announcement,aid)
+ if not ann:raise HTTPException(404,'公告不存在')
+ if u.role=='admin':
+  ac=user_campuses(u)
+  if ann.campus not in ac and ann.author not in (u.name,u.username):
+   raise HTTPException(403,'無權置頂此公告')
+ ann.pinned=not bool(ann.pinned)
+ log(db,u,'pin_announcement',detail=f'{ann.title[:30]} -> pinned={ann.pinned}')
+ db.commit()
+ return {'ok':True,'pinned':ann.pinned}
 
 @app.delete('/api/announcements/{aid}')
 def delete_announcement(aid:str,db=Depends(dbdep),u=Depends(auth)):
@@ -258,8 +323,9 @@ def delete_announcement(aid:str,db=Depends(dbdep),u=Depends(auth)):
   ac=user_campuses(u)
   if ann.campus not in ac and ann.author not in (u.name,u.username):
    raise HTTPException(403,'無權刪除此公告')
- log(db,u,'delete_announcement',detail=ann.title)
+ log(db,u,'delete_announcement',detail=ann.title[:30])
  db.delete(ann);db.commit();return {'ok':True}
+# =====================================================================
 
 @app.get('/api/students')
 def students(db=Depends(dbdep),u=Depends(auth)):
@@ -531,8 +597,6 @@ def export(db=Depends(dbdep),u=Depends(auth)):
   for k,v in (s.equipment or {}).items():sh.append([s.id,k,v.get('size',''),v.get('issued',False),v.get('date','')])
  b=io.BytesIO();w.save(b);b.seek(0);return StreamingResponse(b,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="magic_baseball.xlsx"'})
 
-
-# Bulk Excel import: single transaction; no plaintext passwords in spreadsheets.
 REQUIRED_IMPORT_HEADERS = ['學員姓名','背號','場域','家長姓名','家長電話','新舊生','方案','購買生效日','制服尺寸','球褲尺寸','練習衣尺寸']
 TEMPLATE_IMPORT_HEADERS = ['學員姓名','背號','場域','家長姓名','家長電話','新舊生','方案','購買生效日','原本剩餘堂數','制服尺寸','球褲尺寸','練習衣尺寸']
 
